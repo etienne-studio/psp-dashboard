@@ -54,6 +54,12 @@ st.markdown(
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_bq_client() -> bigquery.Client:
+    # Streamlit Cloud → read SA from secrets; local dev → fall back to ADC.
+    if "gcp_service_account" in st.secrets:
+        from google.oauth2 import service_account
+        info = dict(st.secrets["gcp_service_account"])
+        creds = service_account.Credentials.from_service_account_info(info)
+        return bigquery.Client(project=info.get("project_id", PROJECT_ID), credentials=creds)
     return bigquery.Client(project=PROJECT_ID)
 
 
