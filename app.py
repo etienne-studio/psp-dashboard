@@ -34,6 +34,31 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+
+# ---------------------------------------------------------------------------
+# Password gate (uses st.secrets["app_password"])
+# ---------------------------------------------------------------------------
+def _require_password() -> None:
+    if st.session_state.get("_auth_ok"):
+        return
+    expected = st.secrets.get("app_password", "")
+    if not expected:
+        return  # no password configured
+    st.title("🔒 Accès protégé")
+    st.caption("Entre le mot de passe pour accéder au dashboard.")
+    pw = st.text_input("Mot de passe", type="password", key="_auth_input", label_visibility="collapsed", placeholder="Mot de passe")
+    if pw:
+        if pw == expected:
+            st.session_state["_auth_ok"] = True
+            st.rerun()
+        else:
+            st.error("Mot de passe incorrect.")
+    st.stop()
+
+
+_require_password()
+
+
 # Light visual polish — table sticky header / numeric alignment
 st.markdown(
     """
