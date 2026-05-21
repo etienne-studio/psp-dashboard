@@ -25,7 +25,7 @@ from google.cloud import bigquery
 # Config
 # ---------------------------------------------------------------------------
 PROJECT_ID = os.environ.get("BQ_PROJECT", "eu-andy-marketing-raw")
-CACHE_TTL = 24 * 60 * 60  # 24h
+CACHE_TTL = 24 * 60 * 60  # 24h (build rev 2)
 
 st.set_page_config(
     page_title="Weekly PSP Report",
