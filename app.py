@@ -15,6 +15,7 @@ Deploy to Cloud Run / Streamlit Cloud: see README.md.
 
 from __future__ import annotations
 
+import html as html_lib
 import os
 from datetime import datetime, timezone
 from typing import Iterable
@@ -36,15 +37,92 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Light visual polish — table sticky header / numeric alignment
+# Light visual polish — table sticky header / colored cells / numeric alignment
 st.markdown(
     """
     <style>
-      .block-container { padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1600px; }
-      [data-testid="stDataFrame"] td { font-variant-numeric: tabular-nums; }
+      .block-container { padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1700px; }
       .meta-box { padding: 10px 14px; background: #f1f5f9; border-left: 4px solid #6366f1;
                   border-radius: 4px; font-size: 13px; color: #475569; margin-bottom: 12px; }
       .meta-box b { color: #0f172a; }
+
+      /* PSP custom HTML table */
+      .psp-scroll {
+        overflow: auto;
+        max-height: 800px;
+        border: 1px solid #cbd5e1;
+        border-radius: 6px;
+        background: white;
+      }
+      .psp-table {
+        border-collapse: separate;
+        border-spacing: 0;
+        font-size: 13px;
+        font-variant-numeric: tabular-nums;
+        width: 100%;
+      }
+      .psp-table th, .psp-table td {
+        padding: 6px 12px;
+        border-bottom: 1px solid #f1f5f9;
+        border-right: 1px solid #f1f5f9;
+        white-space: nowrap;
+        text-align: right;
+      }
+      .psp-table thead th {
+        position: sticky;
+        top: 0;
+        background: #f1f5f9;
+        font-weight: 600;
+        color: #334155;
+        border-bottom: 2px solid #cbd5e1;
+        z-index: 2;
+        text-align: center;
+      }
+      .psp-table thead tr:first-child th { top: 0; }
+      .psp-table thead tr:nth-child(2) th { top: 33px; }
+      .psp-table thead th.kpi {
+        z-index: 3;
+        background: #e2e8f0;
+        text-align: left;
+        border-right: 2px solid #94a3b8;
+      }
+      .psp-table tbody td.kpi {
+        position: sticky;
+        left: 0;
+        background: white;
+        text-align: left;
+        font-weight: 500;
+        color: #334155;
+        border-right: 2px solid #94a3b8;
+        z-index: 1;
+        min-width: 230px;
+        max-width: 320px;
+      }
+      .psp-table tbody tr:nth-child(even) td.kpi { background: #fafbfc; }
+      .psp-table tbody tr:nth-child(even) td:not(.kpi) { background: #fafbfc; }
+      .psp-table tbody td.kpi.important { font-weight: 700; color: #0f172a; }
+      .psp-table tbody td.count { color: #0f172a; font-weight: 500; }
+      .psp-table tbody td.count.important { font-weight: 700; }
+      .psp-table tbody td.pct { color: #2563eb; background-color: #f0f7ff; }
+      .psp-table tbody tr:nth-child(even) td.pct { background-color: #e6f1fd; }
+      .psp-table tbody td.churn { color: #dc2626; font-weight: 600; }
+      .psp-table tbody tr:nth-child(even) td.churn { background-color: #fff5f5; }
+      .psp-table tbody tr.section td {
+        background: #1e293b !important;
+        color: #f8fafc;
+        font-weight: 700;
+        font-size: 11px;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        text-align: left;
+        padding: 8px 12px;
+      }
+      .psp-table tbody tr.section td.kpi {
+        position: sticky;
+        left: 0;
+        z-index: 1;
+        border-right: 2px solid #1e293b;
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -106,16 +184,13 @@ FILTER_DIMS = [
     # (filter key, label, fm column-or-expression, ft column-or-expression)
     # If the spec contains "{alias}" it is treated as a raw SQL expression
     # (alias substituted with fm/ft); otherwise it's a plain column name.
-    # NOTE: price expressions are rewired below (after they are defined).
-    ("psp", "PSP", "ms_default_psp", "ms_default_psp"),
-    ("brand", "Brand", "brand", "t_brand"),
-    ("verticale", "Verticale", "sgw_verticale", "sgw_verticale"),
-    ("currency", "Currency", "ms_currency", "ms_currency"),
-    # The two split price filters — rewired with the actual SQL expressions
-    # just below DIMENSION_DIMS (after BOOKING_PRICE_EXPR / MAGAZINE_PRICE_EXPR
-    # are defined).
-    ("price_booking", "Prix Booking", "PLACEHOLDER", "PLACEHOLDER"),
-    ("price_magazine", "Prix Magazine", "PLACEHOLDER", "PLACEHOLDER"),
+    # Expressions are rewired just below DIMENSION_DIMS (after they are defined).
+    ("conciergerie",   "Conciergerie",  "PLACEHOLDER",     "PLACEHOLDER"),
+    ("verticale",      "Verticale",     "sgw_verticale",   "sgw_verticale"),
+    ("psp",            "PSP",           "ms_default_psp",  "ms_default_psp"),
+    ("currency",       "Devise",        "ms_currency",     "ms_currency"),
+    ("price_booking",  "Prix Booking",  "PLACEHOLDER",     "PLACEHOLDER"),
+    ("price_magazine", "Prix Magazine", "PLACEHOLDER",     "PLACEHOLDER"),
 ]
 
 
@@ -173,31 +248,55 @@ MAGAZINE_PRICE_EXPR = (
     "ELSE '' END"
 )
 
+# Conciergerie expression — maps brand to the canonical business name.
+# Same brand for both Booking and Magazine (e.g. "Reserv-Go" and
+# "Reserv-go - magazine" → "Reserv-Go").
+# Two variants: one using fm.brand, one using ft.t_brand.
+def _conciergerie_expr(brand_col: str) -> str:
+    return (
+        f"CASE LOWER(REGEXP_REPLACE(COALESCE({{alias}}.{brand_col}, ''), r' - magazine$', '')) "
+        "  WHEN 'reserv-go'    THEN 'Reserv-Go' "
+        "  WHEN 'book-ici'     THEN 'Book-Ici' "
+        "  WHEN 'rezaflash'    THEN 'Rezaflash' "
+        "  WHEN 'resadexa'     THEN 'Resadexa' "
+        "  WHEN 'jumpaide.com' THEN 'Jumpaide' "
+        "  WHEN 'concimax'     THEN 'Concimax' "
+        "  WHEN 'rapidoxy'     THEN 'Rapidoxy' "
+        "  WHEN 'concicast'    THEN 'Concicast' "
+        f"  ELSE COALESCE({{alias}}.{brand_col}, '') "
+        "END"
+    )
+
+CONCIERGERIE_EXPR_FM = _conciergerie_expr("brand")
+CONCIERGERIE_EXPR_FT = _conciergerie_expr("t_brand")
+
 DIMENSION_DIMS = [
     # (key, label, fm column-or-expression, ft column-or-expression)
     # If the spec contains "{alias}" it is treated as a raw SQL expression
     # (alias substituted with fm/ft/t); otherwise it's a plain column name.
-    ("week", "Semaine", None, None),
-    ("verticale", "Verticale", "sgw_verticale", "sgw_verticale"),
-    ("psp", "PSP", "ms_default_psp", "ms_default_psp"),
-    ("currency", "Currency", "ms_currency", "ms_currency"),
-    ("booking_market", "Booking Market", "sgw_booking_market", "sgw_booking_market"),
-    ("bid_market", "Bid Market", "gad_market", "gad_market"),
-    ("price", "Prix abonnement", PRICE_EXPR, PRICE_EXPR),
+    ("week",         "Semaine",         None,                  None),
+    ("conciergerie", "Conciergerie",    CONCIERGERIE_EXPR_FM,  CONCIERGERIE_EXPR_FT),
+    ("verticale",    "Verticale",       "sgw_verticale",       "sgw_verticale"),
+    ("price",        "Prix abonnement", PRICE_EXPR,            PRICE_EXPR),
+    ("psp",          "PSP",             "ms_default_psp",      "ms_default_psp"),
+    ("currency",     "Devise",          "ms_currency",         "ms_currency"),
+    ("booking_market", "Marché Booking", "sgw_booking_market", "sgw_booking_market"),
 ]
 
 DIM_BY_LABEL = {d[1]: d for d in DIMENSION_DIMS}
 
-# Now that the price expressions are defined, wire the two split filters.
-def _wire_price_filter(k, fm, ft):
+# Now that all expressions are defined, wire the filters that use them.
+def _wire_filter(k, fm, ft):
     if k == "price_booking":
         return (BOOKING_PRICE_EXPR, BOOKING_PRICE_EXPR)
     if k == "price_magazine":
         return (MAGAZINE_PRICE_EXPR, MAGAZINE_PRICE_EXPR)
+    if k == "conciergerie":
+        return (CONCIERGERIE_EXPR_FM, CONCIERGERIE_EXPR_FT)
     return (fm, ft)
 
 FILTER_DIMS = [
-    (k, l, *_wire_price_filter(k, fm, ft))
+    (k, l, *_wire_filter(k, fm, ft))
     for (k, l, fm, ft) in FILTER_DIMS
 ]
 
@@ -689,6 +788,7 @@ def filter_options_sql() -> str:
     """Pull distinct values for each filter dimension from fact_memberships (80-day window)."""
     booking_bucket = BOOKING_PRICE_EXPR.format(alias="fm")
     magazine_bucket = MAGAZINE_PRICE_EXPR.format(alias="fm")
+    conciergerie = CONCIERGERIE_EXPR_FM.format(alias="fm")
     return f"""
 WITH wb AS (
   SELECT DATE_SUB(CURRENT_DATE(), INTERVAL 80 DAY) AS ws_min, CURRENT_DATE() AS ws_max
@@ -696,7 +796,7 @@ WITH wb AS (
 fm_recent AS (
   SELECT
     COALESCE(fm.ms_default_psp,  '') AS psp,
-    COALESCE(fm.brand,           '') AS brand,
+    COALESCE({conciergerie},     '') AS conciergerie,
     COALESCE(fm.sgw_verticale,   '') AS verticale,
     COALESCE(fm.ms_currency,     '') AS currency,
     COALESCE({booking_bucket},   '') AS price_booking,
@@ -710,7 +810,7 @@ fm_recent AS (
     AND LOWER(fm.customer_firstname) NOT LIKE '%test%'
 )
 SELECT dim, val, COUNT(*) AS n FROM fm_recent
-UNPIVOT (val FOR dim IN (psp, brand, verticale, currency, price_booking, price_magazine))
+UNPIVOT (val FOR dim IN (psp, conciergerie, verticale, currency, price_booking, price_magazine))
 WHERE NOT (dim IN ('price_booking', 'price_magazine') AND val = '')
 GROUP BY 1,2
 ORDER BY 1, 3 DESC
@@ -881,7 +981,7 @@ def build_funnel_table(df: pd.DataFrame, brand_type: str, dims: list) -> pd.Data
             return fn() if gr(g, _rx, "elig_u") > 0 else "---"
 
         push(lbl, ["" for _ in groups], section=True)
-        push(f"# {lbl} TBB", [val_or(g, lambda g=g: fmt_int(gr(g, rx, "tbb"))) for g in groups])
+        push(f"# {lbl} To Be Billed", [val_or(g, lambda g=g: fmt_int(gr(g, rx, "tbb"))) for g in groups])
         push(f"% {lbl} Billed", [val_or(g, lambda g=g: fmt_pct(gr(g, rx, "fa_u"), gr(g, rx, "tbb"))) for g in groups])
         push(f"# {lbl} First Attempt (users)", [val_or(g, lambda g=g: fmt_int(gr(g, rx, "fa_u"))) for g in groups])
         push(f"% Success {lbl} First Attempt", [val_or(g, lambda g=g: fmt_pct(gr(g, rx, "fa_succ_tx"), gr(g, rx, "fa_tx"))) for g in groups])
@@ -960,70 +1060,120 @@ def build_vamp_table(df: pd.DataFrame, dims: list) -> pd.DataFrame:
     return out
 
 
-def style_table(df: pd.DataFrame):
-    """Convert section markers to bold rows. Apply multi-level column headers if multiple dims."""
+# Labels of metrics considered "important" (rendered in bold)
+_IMPORTANT_TOKENS = (
+    "# R0 Attempts",
+    "# R0 Succeeded",
+    "# R1 To Be Billed",
+    "# R1 Succeeded (users)",
+    "# R2 To Be Billed",
+    "# R2 Succeeded (users)",
+    "# R3 To Be Billed",
+    "# R3 Succeeded (users)",
+    "# R4 To Be Billed",
+    "# R4 Succeeded (users)",
+    "% VAMP (Total)",
+    "% VAMP (Rx Booking)",
+    "% VAMP (Rx Magazine)",
+    "# Tx Succeeded (Total)",
+)
+
+
+def _esc(v) -> str:
+    return html_lib.escape("" if v is None else str(v))
+
+
+def render_table_html(df: pd.DataFrame) -> str:
+    """Render a built table (from build_funnel_table / build_vamp_table) as
+    a self-contained HTML table with sticky header + sticky first column and
+    color coding for # / % / Churn / important rows."""
     if df.empty:
-        return df
+        return "<div style='color:#64748b;padding:12px;'>Aucune donnée</div>"
 
     dims = df.attrs.get("dims", [])
     groups = df.attrs.get("groups", [])
+    levels = [d[1] for d in dims] if dims else []
 
-    display = df.copy()
-    # First column is __key__ (KPI/section). Rename to "KPI" for display.
-    is_section = display["__key__"].astype(str).str.startswith("__SECTION__")
-    display["__key__"] = display["__key__"].astype(str).str.replace("__SECTION__", "", regex=False)
-
-    # Rename columns: tuple groups → flat strings (or MultiIndex for >1 dim)
-    if not dims or len(dims) == 0:
-        # Single "Total" column
-        rename = {("Total",): "Total"}
-        display.rename(columns=rename, inplace=True)
-        display.rename(columns={"__key__": "KPI"}, inplace=True)
-        column_subset = [c for c in display.columns if c != "KPI"]
-        styler = display.style.set_properties(**{"text-align": "right"}, subset=column_subset)
-        styler = styler.set_properties(**{"text-align": "left", "font-weight": "500"}, subset=["KPI"])
-        styler = styler.apply(
-            lambda s: ["background-color: #e2e8f0; font-weight: 600" if v else "" for v in is_section],
-            axis=0,
+    # ---- Header ----------------------------------------------------------
+    if not dims:
+        # 0 dims — single "Total" column
+        header_html = "<tr><th class='kpi'>KPI</th><th>Total</th></tr>"
+    elif len(dims) == 1:
+        cells = "".join(f"<th>{_esc(g[0])}</th>" for g in groups)
+        header_html = (
+            f"<tr><th class='kpi'>{_esc(levels[0])}</th>{cells}</tr>"
         )
-        return styler.hide(axis="index")
+    else:
+        # 2 dims — 2-row header. Compute spans for outer dim.
+        # Build ordered dict-like: outer -> [inner1, inner2, ...]
+        outer_to_inners: dict = {}
+        for g in groups:
+            outer_to_inners.setdefault(g[0], []).append(g[1])
 
-    if len(dims) == 1:
-        # Single-dim columns — flatten tuples
-        flat = {g: g[0] for g in groups}
-        display.rename(columns=flat, inplace=True)
-        display.rename(columns={"__key__": "KPI"}, inplace=True)
-        col_order = ["KPI"] + [flat[g] for g in groups]
-        display = display[col_order]
-        column_subset = [c for c in display.columns if c != "KPI"]
-        styler = display.style.set_properties(**{"text-align": "right"}, subset=column_subset)
-        styler = styler.set_properties(**{"text-align": "left", "font-weight": "500"}, subset=["KPI"])
-        styler = styler.apply(
-            lambda s: ["background-color: #e2e8f0; font-weight: 600" if v else "" for v in is_section],
-            axis=0,
+        row1_cells = [f"<th class='kpi' rowspan='2'>{_esc(' / '.join(levels))}</th>"]
+        for outer, inners in outer_to_inners.items():
+            row1_cells.append(
+                f"<th colspan='{len(inners)}'>{_esc(outer)}</th>"
+            )
+        row1 = "<tr>" + "".join(row1_cells) + "</tr>"
+
+        row2_cells = []
+        for _outer, inners in outer_to_inners.items():
+            for inner in inners:
+                row2_cells.append(f"<th>{_esc(inner)}</th>")
+        row2 = "<tr>" + "".join(row2_cells) + "</tr>"
+        header_html = row1 + row2
+
+    # ---- Body ------------------------------------------------------------
+    total_cols = len(groups) + 1
+    body_parts = []
+    for _, row in df.iterrows():
+        key = str(row["__key__"])
+        if key.startswith("__SECTION__"):
+            label = key.replace("__SECTION__", "")
+            body_parts.append(
+                f"<tr class='section'><td class='kpi' colspan='{total_cols}'>"
+                f"{_esc(label)}</td></tr>"
+            )
+            continue
+
+        # Cell type
+        if "Churn" in key:
+            cell_class = "churn"
+        elif key.lstrip().startswith("%"):
+            cell_class = "pct"
+        else:
+            cell_class = "count"
+
+        # Important?
+        is_important = any(tok in key for tok in _IMPORTANT_TOKENS)
+        kpi_class = "kpi important" if is_important else "kpi"
+        if is_important and cell_class == "count":
+            cell_class += " important"
+
+        cells_html = "".join(
+            f"<td class='{cell_class}'>{_esc(row.get(g, ''))}</td>"
+            for g in groups
         )
-        return styler.hide(axis="index")
+        body_parts.append(
+            f"<tr><td class='{kpi_class}'>{_esc(key)}</td>{cells_html}</tr>"
+        )
 
-    # Multi-dim: 2 levels (we cap at 2). Build MultiIndex columns.
-    # KPI column → ("KPI", "") at all levels.
-    levels = [d[1] for d in dims]
-    new_cols = [("KPI",) + ("",) * (len(dims) - 1)]
-    new_cols.extend(tuple(g) for g in groups)
-    display.rename(columns={g: g for g in groups}, inplace=True)
-    display.rename(columns={"__key__": ("KPI",) + ("",) * (len(dims) - 1)}, inplace=True)
-    # Reorder: KPI first, then groups
-    display = display[[("KPI",) + ("",) * (len(dims) - 1)] + list(groups)]
-    display.columns = pd.MultiIndex.from_tuples(new_cols, names=levels)
+    body_html = "\n".join(body_parts)
 
-    kpi_col = ("KPI",) + ("",) * (len(dims) - 1)
-    column_subset = [c for c in display.columns if c != kpi_col]
-    styler = display.style.set_properties(**{"text-align": "right"}, subset=column_subset)
-    styler = styler.set_properties(**{"text-align": "left", "font-weight": "500"}, subset=[kpi_col])
-    styler = styler.apply(
-        lambda s: ["background-color: #e2e8f0; font-weight: 600" if v else "" for v in is_section],
-        axis=0,
+    return (
+        f"<div class='psp-scroll'>"
+        f"<table class='psp-table'>"
+        f"<thead>{header_html}</thead>"
+        f"<tbody>{body_html}</tbody>"
+        f"</table>"
+        f"</div>"
     )
-    return styler.hide(axis="index")
+
+
+# Back-compat alias (some old call-sites might still expect it during refactor)
+def style_table(df):
+    return render_table_html(df)
 
 
 # ---------------------------------------------------------------------------
@@ -1101,7 +1251,7 @@ with tab_b:
         try:
             df = run_query(funnel_sql("Booking", filters, dims))
             table = build_funnel_table(df, "Booking", dims)
-            st.dataframe(style_table(table), use_container_width=True, height=min(40 + 28 * len(table), 1100))
+            st.markdown(render_table_html(table), unsafe_allow_html=True)
         except Exception as e:
             st.error(f"Erreur Funnel Booking : {e}")
 
@@ -1110,7 +1260,7 @@ with tab_m:
         try:
             df = run_query(funnel_sql("Magazine", filters, dims))
             table = build_funnel_table(df, "Magazine", dims)
-            st.dataframe(style_table(table), use_container_width=True, height=min(40 + 28 * len(table), 1100))
+            st.markdown(render_table_html(table), unsafe_allow_html=True)
         except Exception as e:
             st.error(f"Erreur Funnel Magazine : {e}")
 
@@ -1119,7 +1269,7 @@ with tab_vc:
         try:
             df = run_query(vamp_cohort_sql(filters, dims))
             table = build_vamp_table(df, dims)
-            st.dataframe(style_table(table), use_container_width=True, height=40 + 28 * len(table))
+            st.markdown(render_table_html(table), unsafe_allow_html=True)
         except Exception as e:
             st.error(f"Erreur VAMP Cohort : {e}")
 
@@ -1128,6 +1278,6 @@ with tab_vd:
         try:
             df = run_query(vamp_date_sql(filters, dims))
             table = build_vamp_table(df, dims)
-            st.dataframe(style_table(table), use_container_width=True, height=40 + 28 * len(table))
+            st.markdown(render_table_html(table), unsafe_allow_html=True)
         except Exception as e:
             st.error(f"Erreur VAMP Date : {e}")
