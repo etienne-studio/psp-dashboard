@@ -103,12 +103,17 @@ def run_query(sql: str) -> pd.DataFrame:
 # Filter dimensions (sidebar multi-select filters applied as WHERE clauses)
 # ---------------------------------------------------------------------------
 FILTER_DIMS = [
-    # (filter key, label, fm column, ft column)
+    # (filter key, label, fm column-or-expression, ft column-or-expression)
+    # If the spec contains "{alias}" it is treated as a raw SQL expression
+    # (alias substituted with fm/ft); otherwise it's a plain column name.
+    # NOTE: PRICE_EXPR is defined below — for "price" we use that same bucket
+    # expression so the filter values match the dimension values.
     ("psp", "PSP", "ms_default_psp", "ms_default_psp"),
     ("brand", "Brand", "brand", "t_brand"),
     ("verticale", "Verticale", "sgw_verticale", "sgw_verticale"),
     ("currency", "Currency", "ms_currency", "ms_currency"),
-    ("price", "Price", "price_name", "price_name"),
+    # "price" is reassigned just below DIMENSION_DIMS (after PRICE_EXPR is defined)
+    ("price", "Prix abonnement", "price_name", "price_name"),
 ]
 
 
@@ -158,6 +163,13 @@ DIMENSION_DIMS = [
 ]
 
 DIM_BY_LABEL = {d[1]: d for d in DIMENSION_DIMS}
+
+# Now that PRICE_EXPR is defined, rewire the "price" filter to use the same
+# bucket expression as the dimension (so filter values match dimension values).
+FILTER_DIMS = [
+    (k, l, PRICE_EXPR if k == "price" else fm, PRICE_EXPR if k == "price" else ft)
+    for (k, l, fm, ft) in FILTER_DIMS
+]
 
 
 def selected_dims(labels: list) -> list:
@@ -247,19 +259,27 @@ def sql_escape(value: str) -> str:
 
 def filter_clauses(scope: str, filters: dict) -> str:
     """Build AND-prefixed SQL clauses for the active filters.
-    scope is 'fm' (memberships) or 'ft' (transactions)."""
+    scope is 'fm' (memberships) or 'ft' (transactions).
+
+    Filter specs containing '{alias}' are treated as raw SQL expressions
+    (alias substituted with scope). Otherwise they're plain column names.
+    """
     lines = []
     for key, _label, fm_col, ft_col in FILTER_DIMS:
         vals = filters.get(key, [])
         if not vals:
             continue
-        col = fm_col if scope == "fm" else ft_col
+        col_spec = fm_col if scope == "fm" else ft_col
+        if "{alias}" in col_spec:
+            target = col_spec.format(alias=scope)
+        else:
+            target = f"{scope}.{col_spec}"
         rendered = ", ".join(f"'{sql_escape(v)}'" if v != "(empty)" else "''" for v in vals)
         has_empty = "(empty)" in vals
         if has_empty:
-            lines.append(f"AND ({scope}.{col} IN ({rendered}) OR {scope}.{col} IS NULL)")
+            lines.append(f"AND ({target} IN ({rendered}) OR {target} IS NULL)")
         else:
-            lines.append(f"AND {scope}.{col} IN ({rendered})")
+            lines.append(f"AND {target} IN ({rendered})")
     return "\n    ".join(lines)
 
 
@@ -637,20 +657,21 @@ ORDER BY w.week_start, {dim_cols_trailing(dims, "da") if has_nw else ""}cat
 
 def filter_options_sql() -> str:
     """Pull distinct values for each filter dimension from fact_memberships (80-day window)."""
-    return """
+    price_bucket = PRICE_EXPR.format(alias="fm")
+    return f"""
 WITH wb AS (
   SELECT DATE_SUB(CURRENT_DATE(), INTERVAL 80 DAY) AS ws_min, CURRENT_DATE() AS ws_max
 ),
 fm_recent AS (
   SELECT
-    COALESCE(ms_default_psp,  '') AS psp,
-    COALESCE(brand,           '') AS brand,
-    COALESCE(sgw_verticale,   '') AS verticale,
-    COALESCE(ms_currency,     '') AS currency,
-    COALESCE(price_name,      '') AS price
+    COALESCE(fm.ms_default_psp,  '') AS psp,
+    COALESCE(fm.brand,           '') AS brand,
+    COALESCE(fm.sgw_verticale,   '') AS verticale,
+    COALESCE(fm.ms_currency,     '') AS currency,
+    COALESCE({price_bucket},     '') AS price
   FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm
   CROSS JOIN wb
-  WHERE DATE(ms_datetime) BETWEEN wb.ws_min AND wb.ws_max
+  WHERE DATE(fm.ms_datetime) BETWEEN wb.ws_min AND wb.ws_max
     AND COALESCE(fm.brand, '') NOT LIKE '%helpprio%'
     AND LOWER(fm.customer_email) NOT LIKE '%@yopmail%'
     AND LOWER(fm.customer_email) NOT LIKE '%@sharebot%'
