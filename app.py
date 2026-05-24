@@ -294,9 +294,12 @@ _DATE_DIM_TRUNC = {
     "date_month": "MONTH",
 }
 # Format string for FORMAT_DATE() to render a column header for each period.
+# Day → DD/MM/YYYY ; Week → "S20 (11/05)" so the user sees the actual Monday;
+# Month → "Mai 2026". Sorting is done in Python by week_start (real date), not
+# by the label, so these can stay human-friendly.
 _DATE_DIM_LABEL_FMT = {
-    "date_day":   "%d/%m",
-    "date_week":  "S%V",
+    "date_day":   "%d/%m/%Y",
+    "date_week":  "S%V (%d/%m)",
     "date_month": "%b %Y",
 }
 # Set of keys recognized as date dims.
@@ -1078,6 +1081,9 @@ def build_funnel_table(df: pd.DataFrame, brand_type: str, dims: list) -> pd.Data
     # Track which (cohort_week × non_week dim combo) tuples we've already counted
     # so cohort-level metrics aren't multiplied by rx_idx repetition.
     cohort_seen = {}
+    # Map display group → sort key (replaces date label with ISO week_start
+    # so chronological sorting works even when labels are "May 2026" / "Apr 2026").
+    group_sort_key = {}
 
     for _, r in df.iterrows():
         g = gk(r)
@@ -1087,6 +1093,14 @@ def build_funnel_table(df: pd.DataFrame, brand_type: str, dims: list) -> pd.Data
                 "rx": {},
             }
             cohort_seen[g] = set()
+            # Build the sort key: same shape as g, but date dims use week_start (ISO).
+            sort_parts = []
+            for d in dims or []:
+                if d[0] in _DATE_DIM_KEYS:
+                    sort_parts.append(str(r.get("week_start", "")))
+                else:
+                    sort_parts.append(_safe_str(r.get(f"dim_{d[0]}", "")))
+            group_sort_key[g] = tuple(sort_parts) if sort_parts else g
 
         # Cohort-level metrics — count once per (week, non_week_dim_combo) inside the group
         cohort_id = (r["week_label"],) + tuple(_safe_str(r.get(f"dim_{d[0]}", "")) for d in non_week)
@@ -1117,7 +1131,7 @@ def build_funnel_table(df: pd.DataFrame, brand_type: str, dims: list) -> pd.Data
         rx_acc["cancel_u"] += int(r["tbb_cancel_users"])
         rx_acc["tbb"] = max(rx_acc["elig_u"] - rx_acc["cancel_u"], 0)
 
-    groups = sorted(by_group.keys())
+    groups = sorted(by_group.keys(), key=lambda g: group_sort_key.get(g, g))
     rows = []
 
     def push(label: str, vals: Iterable, *, section: bool = False) -> None:
@@ -1205,16 +1219,25 @@ def build_vamp_table(df: pd.DataFrame, dims: list) -> pd.DataFrame:
         return tuple(parts)
 
     by_group = {}
+    group_sort_key = {}
     for _, r in df.iterrows():
         g = gk(r)
         bg = by_group.setdefault(g, {})
+        if g not in group_sort_key:
+            sort_parts = []
+            for d in dims or []:
+                if d[0] in _DATE_DIM_KEYS:
+                    sort_parts.append(str(r.get("week_start", "")))
+                else:
+                    sort_parts.append(_safe_str(r.get(f"dim_{d[0]}", "")))
+            group_sort_key[g] = tuple(sort_parts) if sort_parts else g
         cat = r["cat"]
         existing = bg.get(cat, {"n_tx": 0, "n_al": 0})
         existing["n_tx"] += int(r["n_tx"])
         existing["n_al"] += int(r["n_al"])
         bg[cat] = existing
 
-    groups = sorted(by_group.keys())
+    groups = sorted(by_group.keys(), key=lambda g: group_sort_key.get(g, g))
     rows = []
 
     def push(label: str, vals: Iterable, *, section: bool = False) -> None:
