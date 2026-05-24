@@ -117,15 +117,44 @@ FILTER_DIMS = [
 # The "week" dim is special: cohort_week is always available; for non-week dims
 # we project COALESCE(...,'') from fm / ft and group by them.
 # ---------------------------------------------------------------------------
+# Price bucketing expression — depends on brand_type
+# Booking: round to nearest 10€ → 19€ / 29€ / 49€ / 59€ / 69€ buckets
+# Magazine: exact match on ms_price_amount_eur → 25ct / 10ct / 1ct / 1€ / 1.90€
+# {alias} is substituted to fm/ft/t by dim_select_clause depending on scope.
+PRICE_EXPR = (
+    "CASE "
+    "WHEN {alias}.brand_type = 'Booking' THEN "
+    "  CASE CAST(ROUND(COALESCE({alias}.rounded_subscription_price, 0)) AS INT64) "
+    "    WHEN 20 THEN '19€ bi-mensuel' "
+    "    WHEN 30 THEN '29€' "
+    "    WHEN 50 THEN '49€ mensuel' "
+    "    WHEN 60 THEN '59€' "
+    "    WHEN 70 THEN '69€ mensuel' "
+    "    ELSE CONCAT(CAST(CAST(ROUND(COALESCE({alias}.rounded_subscription_price, 0)) AS INT64) AS STRING), '€') "
+    "  END "
+    "WHEN {alias}.brand_type = 'Magazine' THEN "
+    "  CASE "
+    "    WHEN ROUND({alias}.ms_price_amount_eur, 2) = 0.25 THEN '25ct weekly' "
+    "    WHEN ROUND({alias}.ms_price_amount_eur, 2) = 0.10 THEN '10ct weekly' "
+    "    WHEN ROUND({alias}.ms_price_amount_eur, 2) = 0.01 THEN '1ct' "
+    "    WHEN ROUND({alias}.ms_price_amount_eur, 2) = 1.00 THEN '1€' "
+    "    WHEN ROUND({alias}.ms_price_amount_eur, 2) = 1.90 THEN '1.90€' "
+    "    ELSE CONCAT(CAST(ROUND({alias}.ms_price_amount_eur, 2) AS STRING), '€') "
+    "  END "
+    "ELSE '' END"
+)
+
 DIMENSION_DIMS = [
-    # (key, label, fm column, ft column)
+    # (key, label, fm column-or-expression, ft column-or-expression)
+    # If the spec contains "{alias}" it is treated as a raw SQL expression
+    # (alias substituted with fm/ft/t); otherwise it's a plain column name.
     ("week", "Semaine", None, None),
     ("verticale", "Verticale", "sgw_verticale", "sgw_verticale"),
     ("psp", "PSP", "ms_default_psp", "ms_default_psp"),
     ("currency", "Currency", "ms_currency", "ms_currency"),
     ("booking_market", "Booking Market", "sgw_booking_market", "sgw_booking_market"),
     ("bid_market", "Bid Market", "gad_market", "gad_market"),
-    ("price", "Prix abonnement", "price_name", "price_name"),
+    ("price", "Prix abonnement", PRICE_EXPR, PRICE_EXPR),
 ]
 
 DIM_BY_LABEL = {d[1]: d for d in DIMENSION_DIMS}
@@ -141,15 +170,24 @@ def non_week_dims(dims: list) -> list:
 
 
 def dim_select_clause(scope: str, dims: list, indent: int = 4) -> str:
-    """SELECT projections for non-week dim cols. Always ends with a trailing comma+newline."""
+    """SELECT projections for non-week dim cols. Always ends with a trailing comma+newline.
+
+    If the dim spec contains '{alias}' it is treated as a SQL expression (alias
+    substituted with the scope). Otherwise it's a plain column name and is
+    wrapped with COALESCE(scope.col, '').
+    """
     nw = non_week_dims(dims)
     if not nw:
         return ""
     sp = " " * indent
     lines = []
     for key, _label, fm_col, ft_col in nw:
-        col = fm_col if scope == "fm" else ft_col
-        lines.append(f"{sp}COALESCE({scope}.{col}, '') AS dim_{key}")
+        col_spec = fm_col if scope == "fm" else ft_col
+        if "{alias}" in col_spec:
+            expr = col_spec.format(alias=scope)
+            lines.append(f"{sp}COALESCE({expr}, '') AS dim_{key}")
+        else:
+            lines.append(f"{sp}COALESCE({scope}.{col_spec}, '') AS dim_{key}")
     return ",\n".join(lines) + ",\n"
 
 
