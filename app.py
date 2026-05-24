@@ -106,14 +106,16 @@ FILTER_DIMS = [
     # (filter key, label, fm column-or-expression, ft column-or-expression)
     # If the spec contains "{alias}" it is treated as a raw SQL expression
     # (alias substituted with fm/ft); otherwise it's a plain column name.
-    # NOTE: PRICE_EXPR is defined below — for "price" we use that same bucket
-    # expression so the filter values match the dimension values.
+    # NOTE: price expressions are rewired below (after they are defined).
     ("psp", "PSP", "ms_default_psp", "ms_default_psp"),
     ("brand", "Brand", "brand", "t_brand"),
     ("verticale", "Verticale", "sgw_verticale", "sgw_verticale"),
     ("currency", "Currency", "ms_currency", "ms_currency"),
-    # "price" is reassigned just below DIMENSION_DIMS (after PRICE_EXPR is defined)
-    ("price", "Prix abonnement", "price_name", "price_name"),
+    # The two split price filters — rewired with the actual SQL expressions
+    # just below DIMENSION_DIMS (after BOOKING_PRICE_EXPR / MAGAZINE_PRICE_EXPR
+    # are defined).
+    ("price_booking", "Prix Booking", "PLACEHOLDER", "PLACEHOLDER"),
+    ("price_magazine", "Prix Magazine", "PLACEHOLDER", "PLACEHOLDER"),
 ]
 
 
@@ -126,26 +128,48 @@ FILTER_DIMS = [
 # Booking: round to nearest 10€ → 19€ / 29€ / 49€ / 59€ / 69€ buckets
 # Magazine: exact match on ms_price_amount_eur → 25ct / 10ct / 1ct / 1€ / 1.90€
 # {alias} is substituted to fm/ft/t by dim_select_clause depending on scope.
+_BOOKING_BUCKETS = (
+    "CASE CAST(ROUND(COALESCE({alias}.rounded_subscription_price, 0)) AS INT64) "
+    "  WHEN 20 THEN '19€ bi-mensuel' "
+    "  WHEN 30 THEN '29€' "
+    "  WHEN 50 THEN '49€ mensuel' "
+    "  WHEN 60 THEN '59€' "
+    "  WHEN 70 THEN '69€ mensuel' "
+    "  ELSE CONCAT(CAST(CAST(ROUND(COALESCE({alias}.rounded_subscription_price, 0)) AS INT64) AS STRING), '€') "
+    "END"
+)
+_MAGAZINE_BUCKETS = (
+    "CASE "
+    "  WHEN ROUND({alias}.ms_price_amount_eur, 2) = 0.25 THEN '25ct weekly' "
+    "  WHEN ROUND({alias}.ms_price_amount_eur, 2) = 0.10 THEN '10ct weekly' "
+    "  WHEN ROUND({alias}.ms_price_amount_eur, 2) = 0.01 THEN '1ct' "
+    "  WHEN ROUND({alias}.ms_price_amount_eur, 2) = 1.00 THEN '1€' "
+    "  WHEN ROUND({alias}.ms_price_amount_eur, 2) = 1.90 THEN '1.90€' "
+    "  ELSE CONCAT(CAST(ROUND({alias}.ms_price_amount_eur, 2) AS STRING), '€') "
+    "END"
+)
+
+# Unified price expression — used by the "Prix abonnement" DIMENSION (works
+# across brand_types because the dim is typically used inside a brand-scoped tab).
 PRICE_EXPR = (
     "CASE "
-    "WHEN {alias}.brand_type = 'Booking' THEN "
-    "  CASE CAST(ROUND(COALESCE({alias}.rounded_subscription_price, 0)) AS INT64) "
-    "    WHEN 20 THEN '19€ bi-mensuel' "
-    "    WHEN 30 THEN '29€' "
-    "    WHEN 50 THEN '49€ mensuel' "
-    "    WHEN 60 THEN '59€' "
-    "    WHEN 70 THEN '69€ mensuel' "
-    "    ELSE CONCAT(CAST(CAST(ROUND(COALESCE({alias}.rounded_subscription_price, 0)) AS INT64) AS STRING), '€') "
-    "  END "
-    "WHEN {alias}.brand_type = 'Magazine' THEN "
-    "  CASE "
-    "    WHEN ROUND({alias}.ms_price_amount_eur, 2) = 0.25 THEN '25ct weekly' "
-    "    WHEN ROUND({alias}.ms_price_amount_eur, 2) = 0.10 THEN '10ct weekly' "
-    "    WHEN ROUND({alias}.ms_price_amount_eur, 2) = 0.01 THEN '1ct' "
-    "    WHEN ROUND({alias}.ms_price_amount_eur, 2) = 1.00 THEN '1€' "
-    "    WHEN ROUND({alias}.ms_price_amount_eur, 2) = 1.90 THEN '1.90€' "
-    "    ELSE CONCAT(CAST(ROUND({alias}.ms_price_amount_eur, 2) AS STRING), '€') "
-    "  END "
+    f"WHEN {{alias}}.brand_type = 'Booking' THEN {_BOOKING_BUCKETS} "
+    f"WHEN {{alias}}.brand_type = 'Magazine' THEN {_MAGAZINE_BUCKETS} "
+    "ELSE '' END"
+)
+
+# Split expressions — used by the two separate FILTERS.
+# Each returns the bucket only if brand_type matches, '' otherwise. When the
+# user picks a value for "Prix Booking", the filter clause implicitly restricts
+# to Booking rows (Magazine rows return '' and don't match the IN list).
+BOOKING_PRICE_EXPR = (
+    "CASE "
+    f"WHEN {{alias}}.brand_type = 'Booking' THEN {_BOOKING_BUCKETS} "
+    "ELSE '' END"
+)
+MAGAZINE_PRICE_EXPR = (
+    "CASE "
+    f"WHEN {{alias}}.brand_type = 'Magazine' THEN {_MAGAZINE_BUCKETS} "
     "ELSE '' END"
 )
 
@@ -164,10 +188,16 @@ DIMENSION_DIMS = [
 
 DIM_BY_LABEL = {d[1]: d for d in DIMENSION_DIMS}
 
-# Now that PRICE_EXPR is defined, rewire the "price" filter to use the same
-# bucket expression as the dimension (so filter values match dimension values).
+# Now that the price expressions are defined, wire the two split filters.
+def _wire_price_filter(k, fm, ft):
+    if k == "price_booking":
+        return (BOOKING_PRICE_EXPR, BOOKING_PRICE_EXPR)
+    if k == "price_magazine":
+        return (MAGAZINE_PRICE_EXPR, MAGAZINE_PRICE_EXPR)
+    return (fm, ft)
+
 FILTER_DIMS = [
-    (k, l, PRICE_EXPR if k == "price" else fm, PRICE_EXPR if k == "price" else ft)
+    (k, l, *_wire_price_filter(k, fm, ft))
     for (k, l, fm, ft) in FILTER_DIMS
 ]
 
@@ -657,7 +687,8 @@ ORDER BY w.week_start, {dim_cols_trailing(dims, "da") if has_nw else ""}cat
 
 def filter_options_sql() -> str:
     """Pull distinct values for each filter dimension from fact_memberships (80-day window)."""
-    price_bucket = PRICE_EXPR.format(alias="fm")
+    booking_bucket = BOOKING_PRICE_EXPR.format(alias="fm")
+    magazine_bucket = MAGAZINE_PRICE_EXPR.format(alias="fm")
     return f"""
 WITH wb AS (
   SELECT DATE_SUB(CURRENT_DATE(), INTERVAL 80 DAY) AS ws_min, CURRENT_DATE() AS ws_max
@@ -668,7 +699,8 @@ fm_recent AS (
     COALESCE(fm.brand,           '') AS brand,
     COALESCE(fm.sgw_verticale,   '') AS verticale,
     COALESCE(fm.ms_currency,     '') AS currency,
-    COALESCE({price_bucket},     '') AS price
+    COALESCE({booking_bucket},   '') AS price_booking,
+    COALESCE({magazine_bucket},  '') AS price_magazine
   FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm
   CROSS JOIN wb
   WHERE DATE(fm.ms_datetime) BETWEEN wb.ws_min AND wb.ws_max
@@ -678,7 +710,8 @@ fm_recent AS (
     AND LOWER(fm.customer_firstname) NOT LIKE '%test%'
 )
 SELECT dim, val, COUNT(*) AS n FROM fm_recent
-UNPIVOT (val FOR dim IN (psp, brand, verticale, currency, price))
+UNPIVOT (val FOR dim IN (psp, brand, verticale, currency, price_booking, price_magazine))
+WHERE NOT (dim IN ('price_booking', 'price_magazine') AND val = '')
 GROUP BY 1,2
 ORDER BY 1, 3 DESC
 """
