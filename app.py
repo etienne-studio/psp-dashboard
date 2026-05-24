@@ -1389,19 +1389,35 @@ _picked_start, _picked_end = _start_d, _end_d  # remembered for use after dim pi
 
 st.sidebar.divider()
 
-# Sidebar: dimensions (column-axis splits)
+# Sidebar: dimensions (column-axis splits) — two independent dropdowns.
 st.sidebar.header("Dimensions")
-all_dim_labels = [d[1] for d in DIMENSION_DIMS]
-selected_dim_labels = st.sidebar.multiselect(
-    "Splitter les colonnes par (ordre = imbrication, max 2)",
-    options=all_dim_labels,
-    default=["Date (semaine)"],
-    max_selections=2,
-    help="1ʳᵉ dimension = niveau extérieur, 2ᵉ = niveau intérieur. Une seule granularité de Date à la fois (jour/semaine/mois).",
-    key="dim_selector",
+_NONE_LABEL = "— aucune —"
+_all_dim_labels = [d[1] for d in DIMENSION_DIMS]
+_dim_options = [_NONE_LABEL] + _all_dim_labels
+
+dim1_label = st.sidebar.selectbox(
+    "Dimension 1 (extérieure)",
+    options=_dim_options,
+    index=_dim_options.index("Date (semaine)"),
+    help="Niveau extérieur du split de colonnes.",
+    key="dim1_selector",
 )
+dim2_label = st.sidebar.selectbox(
+    "Dimension 2 (intérieure)",
+    options=_dim_options,
+    index=0,
+    help="Niveau intérieur du split. Choisis « aucune » pour ne pas empiler.",
+    key="dim2_selector",
+)
+
+selected_dim_labels = []
+if dim1_label != _NONE_LABEL:
+    selected_dim_labels.append(dim1_label)
+if dim2_label != _NONE_LABEL and dim2_label != dim1_label:
+    selected_dim_labels.append(dim2_label)
+
 dims = selected_dims(selected_dim_labels)
-# Keep only the first date dim (the 3 date granularities are mutually exclusive).
+# Mutually-exclusive date granularities — keep only the first date dim.
 _seen_date = False
 _dims_filtered = []
 for d in dims:
