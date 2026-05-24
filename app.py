@@ -386,30 +386,89 @@ def sql_escape(value: str) -> str:
     return value.replace("'", "''")
 
 
-def filter_clauses(scope: str, filters: dict) -> str:
-    """Build AND-prefixed SQL clauses for the active filters.
-    scope is 'fm' (memberships) or 'ft' (transactions).
+def _has_active_filters(filters: dict) -> bool:
+    return any(filters.get(k[0]) for k in FILTER_DIMS)
 
-    Filter specs containing '{alias}' are treated as raw SQL expressions
-    (alias substituted with scope). Otherwise they're plain column names.
+
+def customer_pool_cte(filters: dict) -> str:
+    """Build the `customer_pool` CTE — customers who have at least one
+    membership matching every active filter (filters are AND-combined across
+    keys, OR-combined within a key). Returns ',\\ncustomer_pool AS (...)' so
+    it can be inserted right after WEEKS_CTE; '' if no active filters.
+
+    Filtering is customer-level: a user selecting "Prix Booking = 19€" keeps
+    every customer who has a Booking sub at 19€, and the funnel/vamp queries
+    will then see ALL of those customers' subscriptions (Booking and Magazine).
     """
-    lines = []
-    for key, _label, fm_col, ft_col in FILTER_DIMS:
+    if not _has_active_filters(filters):
+        return ""
+
+    having_clauses = []
+    for key, _label, fm_col, _ft_col in FILTER_DIMS:
         vals = filters.get(key, [])
         if not vals:
             continue
-        col_spec = fm_col if scope == "fm" else ft_col
-        if "{alias}" in col_spec:
-            target = col_spec.format(alias=scope)
+        if "{alias}" in fm_col:
+            target = fm_col.format(alias="fm")
         else:
-            target = f"{scope}.{col_spec}"
-        rendered = ", ".join(f"'{sql_escape(v)}'" if v != "(empty)" else "''" for v in vals)
+            target = f"fm.{fm_col}"
+        rendered = ", ".join(
+            f"'{sql_escape(v)}'" if v != "(empty)" else "''" for v in vals
+        )
         has_empty = "(empty)" in vals
         if has_empty:
-            lines.append(f"AND ({target} IN ({rendered}) OR {target} IS NULL)")
+            cond = f"({target} IN ({rendered}) OR {target} IS NULL)"
         else:
-            lines.append(f"AND {target} IN ({rendered})")
-    return "\n    ".join(lines)
+            cond = f"{target} IN ({rendered})"
+        having_clauses.append(f"COUNTIF({cond}) > 0")
+
+    if not having_clauses:
+        return ""
+
+    having_sql = "\n    AND ".join(having_clauses)
+    return f""",
+customer_pool AS (
+  SELECT fm.customer_email
+  FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm
+  CROSS JOIN window_bounds wb_cp
+  WHERE DATE(fm.ms_datetime) BETWEEN wb_cp.ws_min AND wb_cp.ws_max
+    AND COALESCE(fm.brand, '') NOT LIKE '%helpprio%'
+    AND LOWER(fm.customer_email) NOT LIKE '%@yopmail%'
+    AND LOWER(fm.customer_email) NOT LIKE '%@sharebot%'
+    AND LOWER(fm.customer_firstname) NOT LIKE '%test%'
+  GROUP BY fm.customer_email
+  HAVING {having_sql}
+)"""
+
+
+def customer_pool_where(alias: str, filters: dict) -> str:
+    """Deprecated — kept for back-compat. Returns '' since we now restrict to
+    the pool via an explicit INNER JOIN (see customer_pool_join)."""
+    return ""
+
+
+def customer_pool_join(alias: str, filters: dict) -> str:
+    """Returns an INNER JOIN against customer_pool to restrict rows to that
+    pool, or '' if no active filters.
+
+    BigQuery cannot decorrelate IN/EXISTS subqueries that reference an
+    aggregated CTE, so we use a plain JOIN — which it can plan efficiently.
+    The pool alias is suffixed with the table alias to avoid collisions when
+    the same pool is referenced from multiple FROM blocks in one query.
+    """
+    if not _has_active_filters(filters):
+        return ""
+    return (
+        f"INNER JOIN customer_pool cp_pool_{alias} "
+        f"ON cp_pool_{alias}.customer_email = {alias}.customer_email"
+    )
+
+
+# Legacy alias for any old call-site that still expects a per-row filter clause.
+# We now route all filters through customer_pool, so this returns the equivalent
+# IN clause too.
+def filter_clauses(scope: str, filters: dict) -> str:
+    return customer_pool_where(scope, filters)
 
 
 # ---------------------------------------------------------------------------
@@ -433,8 +492,11 @@ def funnel_sql(brand_type: str, filters: dict, dims: list) -> str:
         else "AND COALESCE(ft.t_brand, '') NOT LIKE '%helpprio%'"
     )
     default_days = 14 if is_booking else 7
-    fm_filter = filter_clauses("fm", filters)
-    ft_filter = filter_clauses("ft", filters)
+    cp_cte = customer_pool_cte(filters)
+    cp_join_fm = customer_pool_join("fm", filters)
+    cp_join_ft = customer_pool_join("ft", filters)
+    fm_filter = ""  # legacy placeholder (filtering now handled by cp_join)
+    ft_filter = ""
 
     # Dim helpers
     bm_dim_sel = dim_select_clause("fm", dims)             # fm.<col> AS dim_X, ...
@@ -466,7 +528,7 @@ def funnel_sql(brand_type: str, filters: dict, dims: list) -> str:
     return f"""
 DECLARE cutoff_ts TIMESTAMP DEFAULT TIMESTAMP(CURRENT_DATE());
 DECLARE default_days INT64 DEFAULT {default_days};
-{WEEKS_CTE},
+{WEEKS_CTE}{cp_cte},
 bm AS (
   SELECT
     DATE_TRUNC(DATE(c.CreatedAtUtc), WEEK(MONDAY)) AS cohort_week,
@@ -476,6 +538,7 @@ bm AS (
   JOIN `eu-andy-marketing-raw.silver_sgw.stg_customers` c ON fm.customer_id = c.Id
   JOIN `eu-andy-marketing-raw.silver_sgw.stg_memberships` sm
     ON CAST(fm.membership_id AS STRING) = CAST(sm.Id AS STRING)
+  {cp_join_fm}
   CROSS JOIN window_bounds wb
   WHERE DATE(c.CreatedAtUtc) BETWEEN wb.ws_min AND wb.ws_max
     AND DATE_TRUNC(DATE(c.CreatedAtUtc), WEEK(MONDAY)) IN (SELECT week_start FROM weeks)
@@ -512,6 +575,7 @@ bt AS (
     ft.ms_billing_frequency, ft.ms_billing_period
   FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
   JOIN `eu-andy-marketing-raw.silver_sgw.stg_customers` c ON ft.customer_id = c.Id
+  {cp_join_ft}
   CROSS JOIN window_bounds wb
   WHERE DATE(c.CreatedAtUtc) BETWEEN wb.ws_min AND wb.ws_max
     AND ft.t_date BETWEEN wb.ws_min AND CURRENT_DATE()
@@ -633,7 +697,9 @@ ORDER BY w.week_start, {dim_cols_trailing(dims, "da") if has_nw else ""}rx_idx
 
 
 def vamp_cohort_sql(filters: dict, dims: list) -> str:
-    ft_filter = filter_clauses("ft", filters)
+    cp_cte = customer_pool_cte(filters)
+    cp_join_ft = customer_pool_join("ft", filters)
+    ft_filter = ""  # legacy placeholder
     bm_dim_sel = dim_select_clause("ft", dims)
     dims_only_trailing = dim_cols_trailing(dims)
     has_nw = bool(non_week_dims(dims))
@@ -652,12 +718,13 @@ def vamp_cohort_sql(filters: dict, dims: list) -> str:
     )
 
     return f"""
-{WEEKS_CTE},
+{WEEKS_CTE}{cp_cte},
 tx AS (
   SELECT ft.transaction_id, ft.brand_type, ft.invoice_r_index, ft.transaction_amount,
 {bm_dim_sel}    DATE_TRUNC(DATE(c.CreatedAtUtc), WEEK(MONDAY)) AS cohort_week
   FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
   JOIN `eu-andy-marketing-raw.silver_sgw.stg_customers` c ON ft.customer_id = c.Id
+  {cp_join_ft}
   CROSS JOIN window_bounds wb
   WHERE DATE(c.CreatedAtUtc) BETWEEN wb.ws_min AND wb.ws_max
     AND COALESCE(ft.t_brand, '') NOT LIKE '%helpprio%'
@@ -702,9 +769,11 @@ ORDER BY w.week_start, {dim_cols_trailing(dims, "da") if has_nw else ""}cat
 
 
 def vamp_date_sql(filters: dict, dims: list) -> str:
-    ft_filter = filter_clauses("ft", filters)
-    # For al_tx join, replace ft. with t. since alerts join uses alias t
-    ft_filter_t = ft_filter.replace("AND ft.", "AND t.").replace("OR ft.", "OR t.")
+    cp_cte = customer_pool_cte(filters)
+    cp_join_ft = customer_pool_join("ft", filters)
+    cp_join_t = customer_pool_join("t", filters)
+    ft_filter = ""  # legacy placeholder
+    ft_filter_t = ""
     bm_dim_sel_ft = dim_select_clause("ft", dims)
     bm_dim_sel_t = dim_select_clause("t", dims)
     dims_only_trailing = dim_cols_trailing(dims)
@@ -724,11 +793,12 @@ def vamp_date_sql(filters: dict, dims: list) -> str:
     )
 
     return f"""
-{WEEKS_CTE},
+{WEEKS_CTE}{cp_cte},
 tx AS (
   SELECT ft.transaction_id, ft.brand_type, ft.invoice_r_index, ft.transaction_amount,
 {bm_dim_sel_ft}    DATE_TRUNC(ft.t_date, WEEK(MONDAY)) AS tx_week
   FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
+  {cp_join_ft}
   CROSS JOIN window_bounds wb
   WHERE ft.t_date BETWEEN wb.ws_min AND wb.ws_max
     AND COALESCE(ft.t_brand, '') NOT LIKE '%helpprio%'
@@ -764,6 +834,7 @@ al_tx AS (
       WHEN t.brand_type='Magazine' AND t.transaction_amount > 1 THEN 'rx_magazine'
       ELSE NULL END AS cat
   FROM al a JOIN `eu-andy-marketing-raw.dashboard.fact_transactions` t ON a.transaction_id = t.transaction_id
+  {cp_join_t}
   WHERE COALESCE(t.t_brand, '') NOT LIKE '%helpprio%'
     AND LOWER(t.customer_email) NOT LIKE '%@yopmail%'
     AND LOWER(t.customer_email) NOT LIKE '%@sharebot%'
