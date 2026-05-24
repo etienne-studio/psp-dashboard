@@ -845,10 +845,13 @@ tx AS (
 ),
 tx_cat AS (
   SELECT *, CASE
-    WHEN brand_type='Booking' AND invoice_r_index='0' AND transaction_amount <= 1 THEN 'r0_micro'
+    -- R0 trial: any brand, small first transaction (exclusive bucket so no
+    -- double-count downstream).
+    WHEN invoice_r_index='0' AND transaction_amount <= 1 THEN 'r0_micro'
     WHEN invoice_r_index='RX_micro' AND transaction_amount = 0.01 THEN 'rx_micro'
-    WHEN brand_type='Booking' AND transaction_amount > 10 THEN 'rx_booking'
-    WHEN brand_type='Magazine' AND transaction_amount > 1 THEN 'rx_magazine'
+    -- Recurring transactions: categorize by brand, exclude R0 / micro.
+    WHEN brand_type='Booking'  AND invoice_r_index NOT IN ('0','RX_micro') THEN 'rx_booking'
+    WHEN brand_type='Magazine' AND invoice_r_index NOT IN ('0','RX_micro') THEN 'rx_magazine'
     ELSE NULL END AS cat FROM tx
 ){dim_axis_cte},
 ctx AS (
@@ -922,10 +925,10 @@ tx AS (
 ),
 tx_cat AS (
   SELECT *, CASE
-    WHEN brand_type='Booking' AND invoice_r_index='0' AND transaction_amount <= 1 THEN 'r0_micro'
+    WHEN invoice_r_index='0' AND transaction_amount <= 1 THEN 'r0_micro'
     WHEN invoice_r_index='RX_micro' AND transaction_amount = 0.01 THEN 'rx_micro'
-    WHEN brand_type='Booking' AND transaction_amount > 10 THEN 'rx_booking'
-    WHEN brand_type='Magazine' AND transaction_amount > 1 THEN 'rx_magazine'
+    WHEN brand_type='Booking'  AND invoice_r_index NOT IN ('0','RX_micro') THEN 'rx_booking'
+    WHEN brand_type='Magazine' AND invoice_r_index NOT IN ('0','RX_micro') THEN 'rx_magazine'
     ELSE NULL END AS cat FROM tx
 ){dim_axis_cte},
 dtx AS (
@@ -940,10 +943,10 @@ al AS (
 al_tx AS (
   SELECT a.alert_week, t.transaction_id,
 {bm_dim_sel_t}    CASE
-      WHEN t.brand_type='Booking' AND t.invoice_r_index='0' AND t.transaction_amount <= 1 THEN 'r0_micro'
+      WHEN t.invoice_r_index='0' AND t.transaction_amount <= 1 THEN 'r0_micro'
       WHEN t.invoice_r_index='RX_micro' AND t.transaction_amount = 0.01 THEN 'rx_micro'
-      WHEN t.brand_type='Booking' AND t.transaction_amount > 10 THEN 'rx_booking'
-      WHEN t.brand_type='Magazine' AND t.transaction_amount > 1 THEN 'rx_magazine'
+      WHEN t.brand_type='Booking'  AND t.invoice_r_index NOT IN ('0','RX_micro') THEN 'rx_booking'
+      WHEN t.brand_type='Magazine' AND t.invoice_r_index NOT IN ('0','RX_micro') THEN 'rx_magazine'
       ELSE NULL END AS cat
   FROM al a JOIN `eu-andy-marketing-raw.dashboard.fact_transactions` t ON a.transaction_id = t.transaction_id
   {cp_join_t}
