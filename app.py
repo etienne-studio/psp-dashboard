@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import html as html_lib
 import os
-from datetime import datetime, timezone
-from typing import Iterable
+from datetime import date, datetime, timedelta, timezone
+from typing import Iterable, List
 
 import pandas as pd
 import streamlit as st
@@ -274,7 +274,11 @@ DIMENSION_DIMS = [
     # (key, label, fm column-or-expression, ft column-or-expression)
     # If the spec contains "{alias}" it is treated as a raw SQL expression
     # (alias substituted with fm/ft/t); otherwise it's a plain column name.
-    ("week",         "Semaine",         None,                  None),
+    # The three "date_*" keys are mutually exclusive (only one date granularity
+    # makes sense at a time) — the UI keeps just the first date dim selected.
+    ("date_week",    "Date (semaine)",  None,                  None),
+    ("date_day",     "Date (jour)",     None,                  None),
+    ("date_month",   "Date (mois)",     None,                  None),
     ("conciergerie", "Conciergerie",    CONCIERGERIE_EXPR_FM,  CONCIERGERIE_EXPR_FT),
     ("verticale",    "Verticale",       "sgw_verticale",       "sgw_verticale"),
     ("price",        "Prix abonnement", PRICE_EXPR,            PRICE_EXPR),
@@ -282,6 +286,21 @@ DIMENSION_DIMS = [
     ("currency",     "Devise",          "ms_currency",         "ms_currency"),
     ("booking_market", "Marché Booking", "sgw_booking_market", "sgw_booking_market"),
 ]
+
+# Mapping of date dim key → BigQuery DATE_TRUNC granularity argument.
+_DATE_DIM_TRUNC = {
+    "date_day":   "DAY",
+    "date_week":  "WEEK(MONDAY)",
+    "date_month": "MONTH",
+}
+# Format string for FORMAT_DATE() to render a column header for each period.
+_DATE_DIM_LABEL_FMT = {
+    "date_day":   "%d/%m",
+    "date_week":  "S%V",
+    "date_month": "%b %Y",
+}
+# Set of keys recognized as date dims.
+_DATE_DIM_KEYS = set(_DATE_DIM_TRUNC.keys())
 
 DIM_BY_LABEL = {d[1]: d for d in DIMENSION_DIMS}
 
@@ -306,8 +325,18 @@ def selected_dims(labels: list) -> list:
     return [DIM_BY_LABEL[l] for l in labels if l in DIM_BY_LABEL]
 
 
+def date_dim_key(dims: list) -> str:
+    """Return the key of the date dim selected (date_day/date_week/date_month),
+    or None if none selected. Only the first date dim found is used."""
+    for d in dims:
+        if d[0] in _DATE_DIM_KEYS:
+            return d[0]
+    return None
+
+
 def non_week_dims(dims: list) -> list:
-    return [d for d in dims if d[0] != "week"]
+    """Return dims excluding any date dim (back-compat name)."""
+    return [d for d in dims if d[0] not in _DATE_DIM_KEYS]
 
 
 def dim_select_clause(scope: str, dims: list, indent: int = 4) -> str:
@@ -370,16 +399,90 @@ def dim_join_on(left_alias: str, right_alias: str, dims: list) -> str:
 # ---------------------------------------------------------------------------
 # SQL helpers
 # ---------------------------------------------------------------------------
-WEEKS_CTE = """
+def weeks_in_range(start: date, end: date) -> List[date]:
+    """Return all Monday-starting week dates whose week intersects [start, end]."""
+    if start > end:
+        start, end = end, start
+    first = start - timedelta(days=start.weekday())
+    last = end - timedelta(days=end.weekday())
+    out: List[date] = []
+    d = first
+    while d <= last:
+        out.append(d)
+        d += timedelta(days=7)
+    return out
+
+
+def periods_in_range(start: date, end: date, granularity: str = "date_week") -> List[date]:
+    """Return period-start dates within [start, end] for the chosen granularity.
+    granularity is one of: date_day / date_week / date_month."""
+    if start > end:
+        start, end = end, start
+    if granularity == "date_day":
+        out: List[date] = []
+        d = start
+        while d <= end:
+            out.append(d)
+            d += timedelta(days=1)
+        return out
+    if granularity == "date_month":
+        out = []
+        d = date(start.year, start.month, 1)
+        while d <= end:
+            out.append(d)
+            if d.month == 12:
+                d = date(d.year + 1, 1, 1)
+            else:
+                d = date(d.year, d.month + 1, 1)
+        return out
+    return weeks_in_range(start, end)
+
+
+def weeks_cte_sql(weeks_list: List[date], granularity: str = "date_week") -> str:
+    """Build the WITH weeks / window_bounds CTE from a list of period-start dates.
+    Despite the legacy name, this works for any granularity (day/week/month) —
+    we keep the CTE & column names as `weeks` / `week_start` / `week_label` for
+    back-compat with the downstream SQL.
+
+    `window_bounds` covers from the first period to the end of the last period
+    (last day for daily, last day-of-week for weekly, last day-of-month for monthly).
+    """
+    if not weeks_list:
+        weeks_arr = "DATE '1970-01-01'"
+    else:
+        weeks_arr = ", ".join(f"DATE '{w.isoformat()}'" for w in weeks_list)
+    label_fmt = _DATE_DIM_LABEL_FMT.get(granularity, "S%V")
+    # window_bounds: end depends on granularity
+    if granularity == "date_day":
+        ws_max_expr = "MAX(week_start)"
+    elif granularity == "date_month":
+        ws_max_expr = "DATE_SUB(DATE_ADD(MAX(week_start), INTERVAL 1 MONTH), INTERVAL 1 DAY)"
+    else:
+        ws_max_expr = "DATE_ADD(MAX(week_start), INTERVAL 6 DAY)"
+    return f"""
 WITH weeks AS (
   SELECT
-    DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL (w * 7) DAY), WEEK(MONDAY)) AS week_start,
-    FORMAT_DATE('S%V', DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL (w * 7) DAY), WEEK(MONDAY))) AS week_label
-  FROM UNNEST(GENERATE_ARRAY(1, 10)) AS w
+    w AS week_start,
+    FORMAT_DATE('{label_fmt}', w) AS week_label
+  FROM UNNEST([{weeks_arr}]) AS w
 ), window_bounds AS (
-  SELECT MIN(week_start) AS ws_min, DATE_ADD(MAX(week_start), INTERVAL 6 DAY) AS ws_max FROM weeks
+  SELECT MIN(week_start) AS ws_min, {ws_max_expr} AS ws_max FROM weeks
 )
 """
+
+
+# Back-compat constant — fall back to "last 10 complete weeks" if a query is
+# called without an explicit weeks_list (legacy callers).
+def _default_weeks() -> List[date]:
+    today = date.today()
+    # Last 10 complete weeks ending Sunday before today's week.
+    last_complete_sunday = today - timedelta(days=today.weekday() + 1)
+    end = last_complete_sunday
+    start = end - timedelta(days=10 * 7 - 1)
+    return weeks_in_range(start, end)
+
+
+WEEKS_CTE = weeks_cte_sql(_default_weeks())
 
 
 def sql_escape(value: str) -> str:
@@ -474,7 +577,10 @@ def filter_clauses(scope: str, filters: dict) -> str:
 # ---------------------------------------------------------------------------
 # Funnel query (one per brand_type) — supports dynamic dimensions
 # ---------------------------------------------------------------------------
-def funnel_sql(brand_type: str, filters: dict, dims: list) -> str:
+def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date] = None) -> str:
+    granularity = date_dim_key(dims) or "date_week"
+    trunc_arg = _DATE_DIM_TRUNC[granularity]
+    weeks_cte = weeks_cte_sql(weeks_list, granularity) if weeks_list is not None else WEEKS_CTE
     is_booking = brand_type == "Booking"
     token_filter = (
         "AND NOT (sm.Segment = 'unknown' AND sm.Country = '' AND sm.Language = '')"
@@ -528,10 +634,10 @@ def funnel_sql(brand_type: str, filters: dict, dims: list) -> str:
     return f"""
 DECLARE cutoff_ts TIMESTAMP DEFAULT TIMESTAMP(CURRENT_DATE());
 DECLARE default_days INT64 DEFAULT {default_days};
-{WEEKS_CTE}{cp_cte},
+{weeks_cte}{cp_cte},
 bm AS (
   SELECT
-    DATE_TRUNC(DATE(c.CreatedAtUtc), WEEK(MONDAY)) AS cohort_week,
+    DATE_TRUNC(DATE(c.CreatedAtUtc), {trunc_arg}) AS cohort_week,
 {bm_dim_sel}    fm.customer_email, fm.ms_status,
     sm.CancelAtUtc, sm.TrialEndUtc
   FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm
@@ -541,7 +647,7 @@ bm AS (
   {cp_join_fm}
   CROSS JOIN window_bounds wb
   WHERE DATE(c.CreatedAtUtc) BETWEEN wb.ws_min AND wb.ws_max
-    AND DATE_TRUNC(DATE(c.CreatedAtUtc), WEEK(MONDAY)) IN (SELECT week_start FROM weeks)
+    AND DATE_TRUNC(DATE(c.CreatedAtUtc), {trunc_arg}) IN (SELECT week_start FROM weeks)
     AND fm.brand_type = '{brand_type}'
     {helpprio_fm}
     AND LOWER(fm.customer_email) NOT LIKE '%@yopmail%'
@@ -569,7 +675,7 @@ r1_tbb_cte AS (
 ),
 bt AS (
   SELECT DISTINCT
-    DATE_TRUNC(DATE(c.CreatedAtUtc), WEEK(MONDAY)) AS cohort_week,
+    DATE_TRUNC(DATE(c.CreatedAtUtc), {trunc_arg}) AS cohort_week,
     ft.transaction_id, ft.customer_email, ft.membership_id, ft.invoice_r_index,
     ft.transaction_status, ft.is_refunded, ft.t_attempt_index, ft.t_datetime,
     ft.ms_billing_frequency, ft.ms_billing_period
@@ -579,7 +685,7 @@ bt AS (
   CROSS JOIN window_bounds wb
   WHERE DATE(c.CreatedAtUtc) BETWEEN wb.ws_min AND wb.ws_max
     AND ft.t_date BETWEEN wb.ws_min AND CURRENT_DATE()
-    AND DATE_TRUNC(DATE(c.CreatedAtUtc), WEEK(MONDAY)) IN (SELECT week_start FROM weeks)
+    AND DATE_TRUNC(DATE(c.CreatedAtUtc), {trunc_arg}) IN (SELECT week_start FROM weeks)
     AND ft.brand_type = '{brand_type}'
     {helpprio_ft}
     AND LOWER(ft.customer_email) NOT LIKE '%@yopmail%'
@@ -696,7 +802,10 @@ ORDER BY w.week_start, {dim_cols_trailing(dims, "da") if has_nw else ""}rx_idx
 """
 
 
-def vamp_cohort_sql(filters: dict, dims: list) -> str:
+def vamp_cohort_sql(filters: dict, dims: list, weeks_list: List[date] = None) -> str:
+    granularity = date_dim_key(dims) or "date_week"
+    trunc_arg = _DATE_DIM_TRUNC[granularity]
+    weeks_cte = weeks_cte_sql(weeks_list, granularity) if weeks_list is not None else WEEKS_CTE
     cp_cte = customer_pool_cte(filters)
     cp_join_ft = customer_pool_join("ft", filters)
     ft_filter = ""  # legacy placeholder
@@ -718,10 +827,10 @@ def vamp_cohort_sql(filters: dict, dims: list) -> str:
     )
 
     return f"""
-{WEEKS_CTE}{cp_cte},
+{weeks_cte}{cp_cte},
 tx AS (
   SELECT ft.transaction_id, ft.brand_type, ft.invoice_r_index, ft.transaction_amount,
-{bm_dim_sel}    DATE_TRUNC(DATE(c.CreatedAtUtc), WEEK(MONDAY)) AS cohort_week
+{bm_dim_sel}    DATE_TRUNC(DATE(c.CreatedAtUtc), {trunc_arg}) AS cohort_week
   FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
   JOIN `eu-andy-marketing-raw.silver_sgw.stg_customers` c ON ft.customer_id = c.Id
   {cp_join_ft}
@@ -768,7 +877,10 @@ ORDER BY w.week_start, {dim_cols_trailing(dims, "da") if has_nw else ""}cat
 """
 
 
-def vamp_date_sql(filters: dict, dims: list) -> str:
+def vamp_date_sql(filters: dict, dims: list, weeks_list: List[date] = None) -> str:
+    granularity = date_dim_key(dims) or "date_week"
+    trunc_arg = _DATE_DIM_TRUNC[granularity]
+    weeks_cte = weeks_cte_sql(weeks_list, granularity) if weeks_list is not None else WEEKS_CTE
     cp_cte = customer_pool_cte(filters)
     cp_join_ft = customer_pool_join("ft", filters)
     cp_join_t = customer_pool_join("t", filters)
@@ -793,10 +905,10 @@ def vamp_date_sql(filters: dict, dims: list) -> str:
     )
 
     return f"""
-{WEEKS_CTE}{cp_cte},
+{weeks_cte}{cp_cte},
 tx AS (
   SELECT ft.transaction_id, ft.brand_type, ft.invoice_r_index, ft.transaction_amount,
-{bm_dim_sel_ft}    DATE_TRUNC(ft.t_date, WEEK(MONDAY)) AS tx_week
+{bm_dim_sel_ft}    DATE_TRUNC(ft.t_date, {trunc_arg}) AS tx_week
   FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
   {cp_join_ft}
   CROSS JOIN window_bounds wb
@@ -915,7 +1027,7 @@ def _group_keys(df: pd.DataFrame, dims: list) -> tuple:
     def key_for_row(r):
         parts = []
         for d in dims:
-            if d[0] == "week":
+            if d[0] in _DATE_DIM_KEYS:
                 parts.append(str(r["week_label"]))
             else:
                 v = r.get(f"dim_{d[0]}", "")
@@ -945,7 +1057,7 @@ def _safe_str(v) -> str:
 def build_funnel_table(df: pd.DataFrame, brand_type: str, dims: list) -> pd.DataFrame:
     """Pivot the long-format funnel df into a (KPI × dim_combo) display table."""
     # Determine grouping
-    has_week = any(d[0] == "week" for d in dims) if dims else False
+    has_week = any(d[0] in _DATE_DIM_KEYS for d in dims) if dims else False
     non_week = non_week_dims(dims) if dims else []
 
     def gk(r):
@@ -953,7 +1065,7 @@ def build_funnel_table(df: pd.DataFrame, brand_type: str, dims: list) -> pd.Data
             return ("Total",)
         parts = []
         for d in dims:
-            if d[0] == "week":
+            if d[0] in _DATE_DIM_KEYS:
                 parts.append(str(r["week_label"]))
             else:
                 parts.append(_safe_str(r.get(f"dim_{d[0]}", "")))
@@ -1083,7 +1195,7 @@ def build_vamp_table(df: pd.DataFrame, dims: list) -> pd.DataFrame:
             return ("Total",)
         parts = []
         for d in dims:
-            if d[0] == "week":
+            if d[0] in _DATE_DIM_KEYS:
                 parts.append(str(r["week_label"]))
             else:
                 parts.append(_safe_str(r.get(f"dim_{d[0]}", "")))
@@ -1253,18 +1365,55 @@ def style_table(df):
 st.title("📊 Weekly PSP Report")
 st.caption("Funnel + VAMP — basé sur le skill `weekly-psp-report` (v3) — dimensions dynamiques.")
 
+# Sidebar: date range
+st.sidebar.header("Période")
+_today = date.today()
+_default_end = _today - timedelta(days=_today.weekday() + 1)  # last Sunday
+_default_start = _default_end - timedelta(days=10 * 7 - 1)    # 10 weeks before
+_date_range = st.sidebar.date_input(
+    "Plage de cohortes",
+    value=(_default_start, _default_end),
+    min_value=_today - timedelta(days=365 * 2),
+    max_value=_today,
+    help="Les semaines complètes (lundi → dimanche) qui intersectent la plage.",
+    key="date_range",
+)
+if isinstance(_date_range, tuple) and len(_date_range) == 2:
+    _start_d, _end_d = _date_range
+else:
+    _start_d, _end_d = _default_start, _default_end
+_picked_start, _picked_end = _start_d, _end_d  # remembered for use after dim picker
+
+st.sidebar.divider()
+
 # Sidebar: dimensions (column-axis splits)
 st.sidebar.header("Dimensions")
 all_dim_labels = [d[1] for d in DIMENSION_DIMS]
 selected_dim_labels = st.sidebar.multiselect(
     "Splitter les colonnes par (ordre = imbrication, max 2)",
     options=all_dim_labels,
-    default=["Semaine"],
+    default=["Date (semaine)"],
     max_selections=2,
-    help="1ʳᵉ dimension = niveau extérieur, 2ᵉ = niveau intérieur. Tu peux retirer 'Semaine' pour agréger les 10 semaines.",
+    help="1ʳᵉ dimension = niveau extérieur, 2ᵉ = niveau intérieur. Une seule granularité de Date à la fois (jour/semaine/mois).",
     key="dim_selector",
 )
 dims = selected_dims(selected_dim_labels)
+# Keep only the first date dim (the 3 date granularities are mutually exclusive).
+_seen_date = False
+_dims_filtered = []
+for d in dims:
+    if d[0] in _DATE_DIM_KEYS:
+        if _seen_date:
+            continue
+        _seen_date = True
+    _dims_filtered.append(d)
+dims = _dims_filtered
+
+# Now compute the periods list using the granularity that the user picked.
+_granularity = date_dim_key(dims) or "date_week"
+weeks_list = periods_in_range(_picked_start, _picked_end, _granularity)
+_period_word = {"date_day": "jour", "date_week": "semaine", "date_month": "mois"}[_granularity]
+st.sidebar.caption(f"{len(weeks_list)} {_period_word}{'s' if len(weeks_list) > 1 else ''} sélectionné{'s' if len(weeks_list) > 1 else ''}")
 
 st.sidebar.divider()
 
@@ -1320,7 +1469,7 @@ tab_b, tab_m, tab_vc, tab_vd = st.tabs(["Funnel Booking", "Funnel Magazine", "VA
 with tab_b:
     with st.spinner("Funnel Booking…"):
         try:
-            df = run_query(funnel_sql("Booking", filters, dims))
+            df = run_query(funnel_sql("Booking", filters, dims, weeks_list))
             table = build_funnel_table(df, "Booking", dims)
             st.markdown(render_table_html(table), unsafe_allow_html=True)
         except Exception as e:
@@ -1329,7 +1478,7 @@ with tab_b:
 with tab_m:
     with st.spinner("Funnel Magazine…"):
         try:
-            df = run_query(funnel_sql("Magazine", filters, dims))
+            df = run_query(funnel_sql("Magazine", filters, dims, weeks_list))
             table = build_funnel_table(df, "Magazine", dims)
             st.markdown(render_table_html(table), unsafe_allow_html=True)
         except Exception as e:
@@ -1338,7 +1487,7 @@ with tab_m:
 with tab_vc:
     with st.spinner("VAMP Cohort…"):
         try:
-            df = run_query(vamp_cohort_sql(filters, dims))
+            df = run_query(vamp_cohort_sql(filters, dims, weeks_list))
             table = build_vamp_table(df, dims)
             st.markdown(render_table_html(table), unsafe_allow_html=True)
         except Exception as e:
@@ -1347,7 +1496,7 @@ with tab_vc:
 with tab_vd:
     with st.spinner("VAMP Date…"):
         try:
-            df = run_query(vamp_date_sql(filters, dims))
+            df = run_query(vamp_date_sql(filters, dims, weeks_list))
             table = build_vamp_table(df, dims)
             st.markdown(render_table_html(table), unsafe_allow_html=True)
         except Exception as e:
