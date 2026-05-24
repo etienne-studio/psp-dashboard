@@ -123,6 +123,12 @@ st.markdown(
         z-index: 1;
         border-right: 2px solid #1e293b;
       }
+      /* Thick separator between outer-dim groups (e.g. between two weeks
+         when stacking Semaine × Verticale). */
+      .psp-table th.col-boundary,
+      .psp-table td.col-boundary {
+        border-right: 2px solid #475569;
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -1302,6 +1308,7 @@ def render_table_html(df: pd.DataFrame) -> str:
     dims = df.attrs.get("dims", [])
     groups = df.attrs.get("groups", [])
     levels = [d[1] for d in dims] if dims else []
+    boundary_positions: set = set()  # populated below (only when 2 dims)
 
     # ---- Header ----------------------------------------------------------
     if not dims:
@@ -1319,17 +1326,32 @@ def render_table_html(df: pd.DataFrame) -> str:
         for g in groups:
             outer_to_inners.setdefault(g[0], []).append(g[1])
 
+        # Compute boundary positions in `groups`: the last column of each
+        # outer-dim group gets a thick right border in the header & body.
+        idx = 0
+        outer_count = len(outer_to_inners)
+        for o_i, (_outer, inners) in enumerate(outer_to_inners.items()):
+            idx += len(inners)
+            if o_i < outer_count - 1:
+                boundary_positions.add(idx - 1)
+
         row1_cells = [f"<th class='kpi' rowspan='2'>{_esc(' / '.join(levels))}</th>"]
-        for outer, inners in outer_to_inners.items():
+        for o_i, (outer, inners) in enumerate(outer_to_inners.items()):
+            cls = "col-boundary" if o_i < outer_count - 1 else ""
+            cls_attr = f" class='{cls}'" if cls else ""
             row1_cells.append(
-                f"<th colspan='{len(inners)}'>{_esc(outer)}</th>"
+                f"<th colspan='{len(inners)}'{cls_attr}>{_esc(outer)}</th>"
             )
         row1 = "<tr>" + "".join(row1_cells) + "</tr>"
 
         row2_cells = []
+        i = 0
         for _outer, inners in outer_to_inners.items():
             for inner in inners:
-                row2_cells.append(f"<th>{_esc(inner)}</th>")
+                cls = "col-boundary" if i in boundary_positions else ""
+                cls_attr = f" class='{cls}'" if cls else ""
+                row2_cells.append(f"<th{cls_attr}>{_esc(inner)}</th>")
+                i += 1
         row2 = "<tr>" + "".join(row2_cells) + "</tr>"
         header_html = row1 + row2
 
@@ -1361,8 +1383,8 @@ def render_table_html(df: pd.DataFrame) -> str:
             cell_class += " important"
 
         cells_html = "".join(
-            f"<td class='{cell_class}'>{_esc(row.get(g, ''))}</td>"
-            for g in groups
+            f"<td class='{cell_class}{(' col-boundary' if i in boundary_positions else '')}'>{_esc(row.get(g, ''))}</td>"
+            for i, g in enumerate(groups)
         )
         body_parts.append(
             f"<tr><td class='{kpi_class}'>{_esc(key)}</td>{cells_html}</tr>"
