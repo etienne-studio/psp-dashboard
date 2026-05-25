@@ -290,17 +290,13 @@ DIMENSION_DIMS = [
     ("date_month",     "Date (mois)",             None,                          None),
     ("conciergerie",   "Conciergerie",            CONCIERGERIE_EXPR_FM,          CONCIERGERIE_EXPR_FT),
     ("verticale",      "Verticale",               "sgw_verticale",               "sgw_verticale"),
-    # Line-level price bucket (brand-aware): the bucket of the row's own sub.
-    # Useful inside a single brand tab; in mixed-brand views (VAMP) each row
-    # is bucketed by its own brand_type.
-    ("price",          "Prix abonnement (ligne)", PRICE_EXPR,                    PRICE_EXPR),
     # Customer-level price buckets (cp_price CTE).
     # Same semantics as the "Prix Booking" / "Prix Magazine" FILTERS: each
     # customer is assigned ONE Booking bucket (most recent in window) and ONE
     # Magazine bucket, regardless of which row we're looking at. A customer
     # with only Magazine subs lands in '(empty)' for the Booking dim.
-    ("price_booking",  "Prix Booking (client)",   "RAW:cp_price.price_booking",  "RAW:cp_price.price_booking"),
-    ("price_magazine", "Prix Magazine (client)",  "RAW:cp_price.price_magazine", "RAW:cp_price.price_magazine"),
+    ("price_booking",  "Prix Booking",            "RAW:cp_price.price_booking",  "RAW:cp_price.price_booking"),
+    ("price_magazine", "Prix Magazine",           "RAW:cp_price.price_magazine", "RAW:cp_price.price_magazine"),
     ("psp",            "PSP",                     "ms_default_psp",              "ms_default_psp"),
     ("currency",       "Devise",                  "ms_currency",                 "ms_currency"),
     ("booking_market", "Marché Booking",          "sgw_booking_market",          "sgw_booking_market"),
