@@ -512,25 +512,58 @@ def sql_escape(value: str) -> str:
     return value.replace("'", "''")
 
 
+# ---------------------------------------------------------------------------
+# Filter semantics — differentiated by filter kind.
+#
+# CUSTOMER-LEVEL filters (Prix Booking / Prix Magazine):
+#   Keep all customers with AT LEAST ONE matching membership, then show ALL
+#   their rows (Booking + Magazine). Lets the user answer "in the Magazine tab,
+#   show me the behaviour of customers who pay 49€ on Booking" — even though
+#   their Magazine subs have nothing to do with the 49€ Booking bucket.
+#   Implemented via the `customer_pool` CTE (HAVING COUNTIF > 0) joined to the
+#   main FROM blocks.
+#
+# ROW-LEVEL filters (PSP / Verticale / Conciergerie / Devise / Marché Booking):
+#   Each row must independently match the filter. Used to be customer-level
+#   but that was confusing: a customer who had memberships on multiple PSPs
+#   (e.g. NMI then re-routed to Pixxles) would show ALL their memberships
+#   even when filtering on just one PSP. Row-level applies the filter directly
+#   in the WHERE of bm/bt/tx/al_tx.
+# ---------------------------------------------------------------------------
+_CUSTOMER_LEVEL_FILTER_KEYS = ("price_booking", "price_magazine")
+
+
 def _has_active_filters(filters: dict) -> bool:
     return any(filters.get(k[0]) for k in FILTER_DIMS)
 
 
-def customer_pool_cte(filters: dict) -> str:
-    """Build the `customer_pool` CTE — customers who have at least one
-    membership matching every active filter (filters are AND-combined across
-    keys, OR-combined within a key). Returns ',\\ncustomer_pool AS (...)' so
-    it can be inserted right after WEEKS_CTE; '' if no active filters.
+def _has_customer_level_filters(filters: dict) -> bool:
+    return any(filters.get(k) for k in _CUSTOMER_LEVEL_FILTER_KEYS)
 
-    Filtering is customer-level: a user selecting "Prix Booking = 19€" keeps
-    every customer who has a Booking sub at 19€, and the funnel/vamp queries
-    will then see ALL of those customers' subscriptions (Booking and Magazine).
+
+def _has_row_level_filters(filters: dict) -> bool:
+    return any(
+        filters.get(d[0])
+        for d in FILTER_DIMS
+        if d[0] not in _CUSTOMER_LEVEL_FILTER_KEYS
+    )
+
+
+def customer_pool_cte(filters: dict) -> str:
+    """Build the `customer_pool` CTE — restricted to CUSTOMER-LEVEL filters
+    only (Prix Booking / Prix Magazine). For row-level filters, see
+    `row_level_filter_clause`.
+
+    Returns ',\\ncustomer_pool AS (...)' so it can be inserted right after
+    WEEKS_CTE; '' if no customer-level filter is active.
     """
-    if not _has_active_filters(filters):
+    if not _has_customer_level_filters(filters):
         return ""
 
     having_clauses = []
     for key, _label, fm_col, _ft_col in FILTER_DIMS:
+        if key not in _CUSTOMER_LEVEL_FILTER_KEYS:
+            continue
         vals = filters.get(key, [])
         if not vals:
             continue
@@ -574,15 +607,15 @@ def customer_pool_where(alias: str, filters: dict) -> str:
 
 
 def customer_pool_join(alias: str, filters: dict) -> str:
-    """Returns an INNER JOIN against customer_pool to restrict rows to that
-    pool, or '' if no active filters.
+    """Returns an INNER JOIN against customer_pool to restrict rows to the
+    customer-level pool, or '' if no customer-level filter is active.
 
     BigQuery cannot decorrelate IN/EXISTS subqueries that reference an
     aggregated CTE, so we use a plain JOIN — which it can plan efficiently.
     The pool alias is suffixed with the table alias to avoid collisions when
     the same pool is referenced from multiple FROM blocks in one query.
     """
-    if not _has_active_filters(filters):
+    if not _has_customer_level_filters(filters):
         return ""
     return (
         f"INNER JOIN customer_pool cp_pool_{alias} "
@@ -590,9 +623,46 @@ def customer_pool_join(alias: str, filters: dict) -> str:
     )
 
 
+def row_level_filter_clause(scope: str, filters: dict) -> str:
+    """Build ROW-LEVEL filter conditions for non-price filters
+    (PSP / Verticale / Conciergerie / Devise / Marché Booking).
+
+    Returns a chain of '\\n    AND <cond>' clauses ready to be injected at the
+    end of the WHERE block of bm/bt/tx/al_tx; '' if no row-level filter
+    active.
+
+    `scope` is the table alias ('fm', 'ft', or 't') — picked column expression
+    is taken from FILTER_DIMS' fm_col / ft_col, with {alias} substituted.
+    """
+    if not _has_row_level_filters(filters):
+        return ""
+    clauses = []
+    for key, _label, fm_col, ft_col in FILTER_DIMS:
+        if key in _CUSTOMER_LEVEL_FILTER_KEYS:
+            continue
+        vals = filters.get(key, [])
+        if not vals:
+            continue
+        col_spec = fm_col if scope == "fm" else ft_col
+        if "{alias}" in col_spec:
+            target = col_spec.format(alias=scope)
+        else:
+            target = f"{scope}.{col_spec}"
+        rendered = ", ".join(
+            f"'{sql_escape(v)}'" if v != "(empty)" else "''" for v in vals
+        )
+        has_empty = "(empty)" in vals
+        if has_empty:
+            cond = f"({target} IN ({rendered}) OR {target} IS NULL)"
+        else:
+            cond = f"{target} IN ({rendered})"
+        clauses.append(f"AND {cond}")
+    if not clauses:
+        return ""
+    return "\n    " + "\n    ".join(clauses)
+
+
 # Legacy alias for any old call-site that still expects a per-row filter clause.
-# We now route all filters through customer_pool, so this returns the equivalent
-# IN clause too.
 def filter_clauses(scope: str, filters: dict) -> str:
     return customer_pool_where(scope, filters)
 
@@ -703,8 +773,10 @@ def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date
     cp_join_ft = customer_pool_join("ft", filters)
     cp_price_cte = customer_price_cte(dims)
     cp_price_join_fm = customer_price_join("fm", dims)
-    fm_filter = ""  # legacy placeholder (filtering now handled by cp_join)
-    ft_filter = ""
+    # Row-level filters (PSP / Verticale / Conciergerie / Devise / Marché Booking)
+    # — applied directly in WHERE of bm and bt so non-matching rows are excluded.
+    fm_filter = row_level_filter_clause("fm", filters)
+    ft_filter = row_level_filter_clause("ft", filters)
 
     # Dim helpers
     bm_dim_sel = dim_select_clause("fm", dims)             # fm.<col> AS dim_X, ...
@@ -913,7 +985,7 @@ def vamp_cohort_sql(filters: dict, dims: list, weeks_list: List[date] = None) ->
     cp_join_ft = customer_pool_join("ft", filters)
     cp_price_cte = customer_price_cte(dims)
     cp_price_join_ft = customer_price_join("ft", dims)
-    ft_filter = ""  # legacy placeholder
+    ft_filter = row_level_filter_clause("ft", filters)
     bm_dim_sel = dim_select_clause("ft", dims)
     dims_only_trailing = dim_cols_trailing(dims)
     has_nw = bool(non_week_dims(dims))
@@ -996,8 +1068,8 @@ def vamp_date_sql(filters: dict, dims: list, weeks_list: List[date] = None) -> s
     cp_price_cte = customer_price_cte(dims)
     cp_price_join_ft = customer_price_join("ft", dims)
     cp_price_join_t = customer_price_join("t", dims)
-    ft_filter = ""  # legacy placeholder
-    ft_filter_t = ""
+    ft_filter = row_level_filter_clause("ft", filters)
+    ft_filter_t = row_level_filter_clause("t", filters)
     bm_dim_sel_ft = dim_select_clause("ft", dims)
     bm_dim_sel_t = dim_select_clause("t", dims)
     dims_only_trailing = dim_cols_trailing(dims)
