@@ -278,19 +278,32 @@ CONCIERGERIE_EXPR_FT = _conciergerie_expr("t_brand")
 
 DIMENSION_DIMS = [
     # (key, label, fm column-or-expression, ft column-or-expression)
-    # If the spec contains "{alias}" it is treated as a raw SQL expression
-    # (alias substituted with fm/ft/t); otherwise it's a plain column name.
+    # Spec shapes (see dim_select_clause):
+    #   - 'RAW:<expr>'    → raw expression (no scope prefix). Used for
+    #                       cp_price.price_booking / cp_price.price_magazine.
+    #   - '...{alias}...' → SQL expression with {alias} substituted to scope.
+    #   - 'col_name'      → plain column (wrapped with COALESCE(scope.col, '')).
     # The three "date_*" keys are mutually exclusive (only one date granularity
     # makes sense at a time) — the UI keeps just the first date dim selected.
-    ("date_week",    "Date (semaine)",  None,                  None),
-    ("date_day",     "Date (jour)",     None,                  None),
-    ("date_month",   "Date (mois)",     None,                  None),
-    ("conciergerie", "Conciergerie",    CONCIERGERIE_EXPR_FM,  CONCIERGERIE_EXPR_FT),
-    ("verticale",    "Verticale",       "sgw_verticale",       "sgw_verticale"),
-    ("price",        "Prix abonnement", PRICE_EXPR,            PRICE_EXPR),
-    ("psp",          "PSP",             "ms_default_psp",      "ms_default_psp"),
-    ("currency",     "Devise",          "ms_currency",         "ms_currency"),
-    ("booking_market", "Marché Booking", "sgw_booking_market", "sgw_booking_market"),
+    ("date_week",      "Date (semaine)",          None,                          None),
+    ("date_day",       "Date (jour)",             None,                          None),
+    ("date_month",     "Date (mois)",             None,                          None),
+    ("conciergerie",   "Conciergerie",            CONCIERGERIE_EXPR_FM,          CONCIERGERIE_EXPR_FT),
+    ("verticale",      "Verticale",               "sgw_verticale",               "sgw_verticale"),
+    # Line-level price bucket (brand-aware): the bucket of the row's own sub.
+    # Useful inside a single brand tab; in mixed-brand views (VAMP) each row
+    # is bucketed by its own brand_type.
+    ("price",          "Prix abonnement (ligne)", PRICE_EXPR,                    PRICE_EXPR),
+    # Customer-level price buckets (cp_price CTE).
+    # Same semantics as the "Prix Booking" / "Prix Magazine" FILTERS: each
+    # customer is assigned ONE Booking bucket (most recent in window) and ONE
+    # Magazine bucket, regardless of which row we're looking at. A customer
+    # with only Magazine subs lands in '(empty)' for the Booking dim.
+    ("price_booking",  "Prix Booking (client)",   "RAW:cp_price.price_booking",  "RAW:cp_price.price_booking"),
+    ("price_magazine", "Prix Magazine (client)",  "RAW:cp_price.price_magazine", "RAW:cp_price.price_magazine"),
+    ("psp",            "PSP",                     "ms_default_psp",              "ms_default_psp"),
+    ("currency",       "Devise",                  "ms_currency",                 "ms_currency"),
+    ("booking_market", "Marché Booking",          "sgw_booking_market",          "sgw_booking_market"),
 ]
 
 # Mapping of date dim key → BigQuery DATE_TRUNC granularity argument.
@@ -351,9 +364,11 @@ def non_week_dims(dims: list) -> list:
 def dim_select_clause(scope: str, dims: list, indent: int = 4) -> str:
     """SELECT projections for non-week dim cols. Always ends with a trailing comma+newline.
 
-    If the dim spec contains '{alias}' it is treated as a SQL expression (alias
-    substituted with the scope). Otherwise it's a plain column name and is
-    wrapped with COALESCE(scope.col, '').
+    Three shapes supported in the dim spec (fm_col / ft_col):
+      - 'RAW:<expr>'         → use <expr> as-is (no scope prefix). Used for
+                               cross-table expressions like `cp_price.price_booking`.
+      - '...{alias}...'      → SQL expression; {alias} substituted with scope.
+      - 'col_name'           → plain column; rendered as `COALESCE(scope.col_name, '')`.
     """
     nw = non_week_dims(dims)
     if not nw:
@@ -362,7 +377,10 @@ def dim_select_clause(scope: str, dims: list, indent: int = 4) -> str:
     lines = []
     for key, _label, fm_col, ft_col in nw:
         col_spec = fm_col if scope == "fm" else ft_col
-        if "{alias}" in col_spec:
+        if col_spec.startswith("RAW:"):
+            raw = col_spec[4:]
+            lines.append(f"{sp}COALESCE({raw}, '') AS dim_{key}")
+        elif "{alias}" in col_spec:
             expr = col_spec.format(alias=scope)
             lines.append(f"{sp}COALESCE({expr}, '') AS dim_{key}")
         else:
@@ -584,6 +602,83 @@ def filter_clauses(scope: str, filters: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# customer_price CTE — customer-level price-bucket lookup.
+#
+# Mirrors the FILTER semantics for "Prix Booking" / "Prix Magazine" but exposed
+# as a DIMENSION (column-axis split). For each customer, we compute:
+#   - price_booking  = bucket of their MOST RECENT Booking membership
+#                      (NULL if they never had a Booking sub in the window)
+#   - price_magazine = idem for Magazine
+# Then the funnel/vamp queries LEFT JOIN this CTE on customer_email and project
+# COALESCE(cp_price.price_booking, '') AS dim_price_booking.
+#
+# Why MOST RECENT (not MAX): if a customer upgrades 19€ → 49€, we want to
+# represent them as "49€ customer" (current state). ARRAY_AGG ORDER BY
+# ms_datetime DESC LIMIT 1 gives the most-recent non-NULL bucket.
+# ---------------------------------------------------------------------------
+_CP_PRICE_DIM_KEYS = ("price_booking", "price_magazine")
+
+
+def _has_cp_price_dim(dims: list) -> bool:
+    """True iff the user selected a customer-level price dim."""
+    return any(d[0] in _CP_PRICE_DIM_KEYS for d in dims)
+
+
+def customer_price_cte(dims: list) -> str:
+    """Build the `customer_price` CTE — one row per customer with their most
+    recent Booking & Magazine bucket. Returns ',\\ncustomer_price AS (...)' so
+    it can be appended right after WEEKS_CTE / customer_pool_cte; '' if no
+    customer-level price dim is selected.
+
+    Depends on `window_bounds` (from weeks_cte_sql) — must be emitted AFTER it.
+    """
+    if not _has_cp_price_dim(dims):
+        return ""
+    bb = _BOOKING_BUCKETS.format(alias="fm")
+    mb = _MAGAZINE_BUCKETS.format(alias="fm")
+    return f""",
+customer_price AS (
+  SELECT
+    fm.customer_email,
+    ARRAY_AGG(
+      CASE WHEN fm.brand_type = 'Booking' THEN {bb} ELSE NULL END
+      IGNORE NULLS ORDER BY fm.ms_datetime DESC LIMIT 1
+    )[SAFE_OFFSET(0)] AS price_booking,
+    ARRAY_AGG(
+      CASE WHEN fm.brand_type = 'Magazine' THEN {mb} ELSE NULL END
+      IGNORE NULLS ORDER BY fm.ms_datetime DESC LIMIT 1
+    )[SAFE_OFFSET(0)] AS price_magazine
+  FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm
+  CROSS JOIN window_bounds wb_cp_price
+  WHERE DATE(fm.ms_datetime) BETWEEN wb_cp_price.ws_min AND wb_cp_price.ws_max
+    AND COALESCE(fm.brand, '') NOT LIKE '%helpprio%'
+    AND LOWER(fm.customer_email) NOT LIKE '%@yopmail%'
+    AND LOWER(fm.customer_email) NOT LIKE '%@sharebot%'
+    AND LOWER(fm.customer_firstname) NOT LIKE '%test%'
+  GROUP BY fm.customer_email
+)"""
+
+
+def customer_price_join(alias: str, dims: list) -> str:
+    """LEFT JOIN against customer_price keyed on customer_email, or '' when no
+    customer-level price dim is selected.
+
+    LEFT (not INNER): customers absent from fact_memberships in the window
+    (rare — can happen if a tx exists inside the window but their memberships
+    are outside) should still appear, with NULL → '(empty)' bucket.
+
+    The cp_price alias is a constant (not suffixed). Each SQL function only
+    references it from one CTE per table alias, so no collisions.
+    """
+    if not _has_cp_price_dim(dims):
+        return ""
+    return (
+        f"LEFT JOIN customer_price cp_price "
+        f"ON cp_price.customer_email = {alias}.customer_email"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Funnel query (one per brand_type) — supports dynamic dimensions
 # ---------------------------------------------------------------------------
 def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date] = None) -> str:
@@ -610,6 +705,8 @@ def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date
     cp_cte = customer_pool_cte(filters)
     cp_join_fm = customer_pool_join("fm", filters)
     cp_join_ft = customer_pool_join("ft", filters)
+    cp_price_cte = customer_price_cte(dims)
+    cp_price_join_fm = customer_price_join("fm", dims)
     fm_filter = ""  # legacy placeholder (filtering now handled by cp_join)
     ft_filter = ""
 
@@ -643,7 +740,7 @@ def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date
     return f"""
 DECLARE cutoff_ts TIMESTAMP DEFAULT TIMESTAMP(CURRENT_DATE());
 DECLARE default_days INT64 DEFAULT {default_days};
-{weeks_cte}{cp_cte},
+{weeks_cte}{cp_cte}{cp_price_cte},
 bm AS (
   SELECT
     DATE_TRUNC(DATE(c.CreatedAtUtc), {trunc_arg}) AS cohort_week,
@@ -654,6 +751,7 @@ bm AS (
   JOIN `eu-andy-marketing-raw.silver_sgw.stg_memberships` sm
     ON CAST(fm.membership_id AS STRING) = CAST(sm.Id AS STRING)
   {cp_join_fm}
+  {cp_price_join_fm}
   CROSS JOIN window_bounds wb
   WHERE DATE(c.CreatedAtUtc) BETWEEN wb.ws_min AND wb.ws_max
     AND DATE_TRUNC(DATE(c.CreatedAtUtc), {trunc_arg}) IN (SELECT week_start FROM weeks)
@@ -817,6 +915,8 @@ def vamp_cohort_sql(filters: dict, dims: list, weeks_list: List[date] = None) ->
     weeks_cte = weeks_cte_sql(weeks_list, granularity) if weeks_list is not None else WEEKS_CTE
     cp_cte = customer_pool_cte(filters)
     cp_join_ft = customer_pool_join("ft", filters)
+    cp_price_cte = customer_price_cte(dims)
+    cp_price_join_ft = customer_price_join("ft", dims)
     ft_filter = ""  # legacy placeholder
     bm_dim_sel = dim_select_clause("ft", dims)
     dims_only_trailing = dim_cols_trailing(dims)
@@ -836,13 +936,14 @@ def vamp_cohort_sql(filters: dict, dims: list, weeks_list: List[date] = None) ->
     )
 
     return f"""
-{weeks_cte}{cp_cte},
+{weeks_cte}{cp_cte}{cp_price_cte},
 tx AS (
   SELECT ft.transaction_id, ft.brand_type, ft.invoice_r_index, ft.transaction_amount,
 {bm_dim_sel}    DATE_TRUNC(DATE(c.CreatedAtUtc), {trunc_arg}) AS cohort_week
   FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
   JOIN `eu-andy-marketing-raw.silver_sgw.stg_customers` c ON ft.customer_id = c.Id
   {cp_join_ft}
+  {cp_price_join_ft}
   CROSS JOIN window_bounds wb
   WHERE DATE(c.CreatedAtUtc) BETWEEN wb.ws_min AND wb.ws_max
     AND COALESCE(ft.t_brand, '') NOT LIKE '%helpprio%'
@@ -896,6 +997,9 @@ def vamp_date_sql(filters: dict, dims: list, weeks_list: List[date] = None) -> s
     cp_cte = customer_pool_cte(filters)
     cp_join_ft = customer_pool_join("ft", filters)
     cp_join_t = customer_pool_join("t", filters)
+    cp_price_cte = customer_price_cte(dims)
+    cp_price_join_ft = customer_price_join("ft", dims)
+    cp_price_join_t = customer_price_join("t", dims)
     ft_filter = ""  # legacy placeholder
     ft_filter_t = ""
     bm_dim_sel_ft = dim_select_clause("ft", dims)
@@ -917,12 +1021,13 @@ def vamp_date_sql(filters: dict, dims: list, weeks_list: List[date] = None) -> s
     )
 
     return f"""
-{weeks_cte}{cp_cte},
+{weeks_cte}{cp_cte}{cp_price_cte},
 tx AS (
   SELECT ft.transaction_id, ft.brand_type, ft.invoice_r_index, ft.transaction_amount,
 {bm_dim_sel_ft}    DATE_TRUNC(ft.t_date, {trunc_arg}) AS tx_week
   FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
   {cp_join_ft}
+  {cp_price_join_ft}
   CROSS JOIN window_bounds wb
   WHERE ft.t_date BETWEEN wb.ws_min AND wb.ws_max
     AND COALESCE(ft.t_brand, '') NOT LIKE '%helpprio%'
@@ -959,6 +1064,7 @@ al_tx AS (
       ELSE NULL END AS cat
   FROM al a JOIN `eu-andy-marketing-raw.dashboard.fact_transactions` t ON a.transaction_id = t.transaction_id
   {cp_join_t}
+  {cp_price_join_t}
   WHERE COALESCE(t.t_brand, '') NOT LIKE '%helpprio%'
     AND LOWER(t.customer_email) NOT LIKE '%@yopmail%'
     AND LOWER(t.customer_email) NOT LIKE '%@sharebot%'
