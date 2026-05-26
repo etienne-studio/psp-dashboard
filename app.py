@@ -1643,28 +1643,35 @@ def exec_summary_sql() -> str:
       - conciergerie ∈ {Reserv-Go, Book-Ici, Resadexa, Rezaflash, Jumpaide,
                         Concimax, Rapidoxy}
       - psp = LOWER(ms_default_psp) (e.g. 'trustpayment', 'pixxles', 'nmi')
-      - bucket ∈ {'s1' (last completed Mon-Sun), 's2' (week before)}
-      - metric ∈ {r0, tbb_count, r1_net_count, brut, refund, tx_succ_no_r0,
-                  alerts_no_r0, alerts_all}
+      - bucket ∈ {'s1' (current Month-to-Date), 's2' (previous month same window)}
+      - metric ∈ {r0, tbb_count, r1_net_count, brut, refund_rev,
+                  tx_succ_visa, alerts_visa}
       - value FLOAT64
 
     Window is fixed (CURRENT_DATE() server-side). Ignores sidebar
     date/dimensions/filters by design.
 
+      - s1 = MTD courant : 1st of current month → yesterday
+      - s2 = MTD M-1     : 1st of previous month → same day-of-month as s1_end
+
     KPIs derived in Python from these atoms (see render_exec_summary):
-      - R0                = r0                  (customer-level count, not membership)
-      - CA Net            = brut - refund_revenue (brut by t_date; refund by refunded_at_utc)
+      - R0                = r0                            (customer-level count, not membership)
+      - CA Net            = brut - refund_rev             (brut by t_date; refund by refunded_at_utc)
       - % Churn R0→R1 net = 1 - (r1_net_count / tbb_count)  (Booking ONLY)
-      - % Refund          = refund_revenue / brut   (CA-based, dates differentiated)
-      - % VAMP Ratio      = alerts_all / tx_succ_all  (ALL R indexes, R0 included)
+      - % Refund          = refund_rev / brut             (CA-based, dates differentiated)
+      - % VAMP Ratio      = alerts_visa / tx_succ_visa    (VISA only — VAMP = Visa Acquirer Monitoring Program)
 
     Date semantics:
-      - r0          : by ms_date (signup date)
-      - tbb_cohort  : by ms_trial_end (cohort that should have been billed in week)
-      - brut        : by t_date (transaction date) for status='succeeded' tx
-      - refund_rev  : by refunded_at_utc (refund date), independent of t_date
-      - tx_succ_all : by t_date (transaction date)
-      - alerts_all  : by alerted_at (alert date), independent of t_date
+      - r0           : by ms_date (signup date)
+      - tbb_cohort   : by ms_trial_end (cohort that should have been billed in window)
+      - brut         : by t_date (transaction date) for status='succeeded' tx (all cards)
+      - refund_rev   : by refunded_at_utc (refund date), independent of t_date (all cards)
+      - tx_succ_visa : by t_date (transaction date), VISA + DELTA only
+      - alerts_visa  : by alerted_at (alert date), cardnetwork='Visa' only
+
+    Card scope:
+      - r0 / brut / refund_rev : all card brands (R0, CA, Refund are global metrics)
+      - tx_succ_visa / alerts_visa : Visa only (DELTA = Visa Debit UK, same network)
     """
     # Conciergerie canonical mapping — same logic as CONCIERGERIE_EXPR_FM/FT
     # but inlined with the conciergerie names this tab cares about.
@@ -1687,11 +1694,15 @@ def exec_summary_sql() -> str:
 
     return f"""
 WITH weeks_def AS (
+  -- s1 = current Month-to-Date (1st of current month → yesterday)
+  -- s2 = same window one month earlier (1st of prev month → same day-of-month
+  --      as yesterday). BQ DATE_SUB(... INTERVAL 1 MONTH) clips to last valid
+  --      day when the target month is shorter (e.g. Mar 31 - 1m → Feb 28/29).
   SELECT
-    DATE_SUB(DATE_TRUNC(CURRENT_DATE(), WEEK(MONDAY)), INTERVAL 7  DAY) AS s1_start,
-    DATE_SUB(DATE_TRUNC(CURRENT_DATE(), WEEK(MONDAY)), INTERVAL 1  DAY) AS s1_end,
-    DATE_SUB(DATE_TRUNC(CURRENT_DATE(), WEEK(MONDAY)), INTERVAL 14 DAY) AS s2_start,
-    DATE_SUB(DATE_TRUNC(CURRENT_DATE(), WEEK(MONDAY)), INTERVAL 8  DAY) AS s2_end
+    DATE_TRUNC(CURRENT_DATE(), MONTH)                                            AS s1_start,
+    DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)                                     AS s1_end,
+    DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 1 MONTH)                AS s2_start,
+    DATE_SUB(DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY), INTERVAL 1 MONTH)         AS s2_end
 ),
 fm_in_window AS (
   SELECT
@@ -1800,10 +1811,24 @@ refund_in_window AS (
   WHERE ft.is_refunded = TRUE
     AND ft.refunded_at_utc BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
 ),
+ft_visa_in_window AS (
+  -- Visa-only succeeded tx — used as VAMP denominator. Includes DELTA
+  -- (Visa Debit UK, same network). All R indexes counted.
+  SELECT ft.transaction_id, ft.t_date, ft.ms_default_psp AS psp,
+    {ft_conc} AS conciergerie,
+    CASE
+      WHEN ft.t_date BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
+      WHEN ft.t_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s2_end FROM weeks_def) THEN 's2'
+    END AS bucket
+  FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
+  WHERE ft.t_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
+    AND ft.transaction_status = 'succeeded'
+    AND UPPER(ft.t_card_brand) IN ('VISA', 'DELTA')
+),
 tx_metrics AS (
-  -- 'brut'        : € of succeeded tx by t_date (all R indexes)
-  -- 'refund_rev'  : € of refunds by refunded_at_utc (all R indexes)
-  -- 'tx_succ_all' : # of succeeded tx by t_date (all R indexes — VAMP denom)
+  -- 'brut'         : € of succeeded tx by t_date (all card brands)
+  -- 'refund_rev'   : € of refunds by refunded_at_utc (all card brands)
+  -- 'tx_succ_visa' : # of succeeded Visa+Delta tx by t_date — VAMP denominator
   SELECT conciergerie, psp, bucket, 'brut' AS metric,
     SUM(CASE WHEN transaction_status='succeeded' THEN transaction_amount ELSE 0 END) AS value
   FROM ft_in_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
@@ -1812,14 +1837,16 @@ tx_metrics AS (
     SUM(transaction_amount) AS value
   FROM refund_in_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
   UNION ALL
-  SELECT conciergerie, psp, bucket, 'tx_succ_all' AS metric,
-    CAST(COUNT(DISTINCT CASE WHEN transaction_status='succeeded' THEN transaction_id END) AS FLOAT64) AS value
-  FROM ft_in_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+  SELECT conciergerie, psp, bucket, 'tx_succ_visa' AS metric,
+    CAST(COUNT(DISTINCT transaction_id) AS FLOAT64) AS value
+  FROM ft_visa_in_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
 ),
 alerts_join AS (
-  -- Each alert is joined to its underlying transaction to recover the
-  -- conciergerie / PSP / R-index (fact_alert doesn't keep t_brand). The
-  -- fact_alert VIEW already excludes Order Insight + Order Insight 3.0.
+  -- Visa-only alerts. fact_alert is a VIEW that already excludes Order
+  -- Insight + Order Insight 3.0. We further restrict to cardnetwork='Visa'
+  -- because the cards + VAMP only care about Visa (VAMP = Visa Acquirer
+  -- Monitoring Program). Joined to fact_transactions on transaction_id to
+  -- recover t_brand / ms_default_psp / invoice_r_index.
   SELECT
     fa.transaction_id, fa.alerted_at,
     {t_conc} AS conciergerie,
@@ -1832,13 +1859,13 @@ alerts_join AS (
   FROM `eu-andy-marketing-raw.dashboard.fact_alert` fa
   JOIN `eu-andy-marketing-raw.dashboard.fact_transactions` t USING (transaction_id)
   WHERE fa.alerted_at BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
+    AND UPPER(fa.cardnetwork) = 'VISA'
 ),
 alerts_metrics AS (
-  -- 'alerts_all' = every alert (R0 + Rx), by alerted_at, with Order Insight
-  -- already filtered out at the fact_alert VIEW level. Used by both:
-  --   * the top "Alertes par société" cards
-  --   * the VAMP Ratio numerator (per user request, R0 included)
-  SELECT conciergerie, psp, bucket, 'alerts_all' AS metric,
+  -- 'alerts_visa' = Visa alerts (R0 + Rx) by alerted_at. Used by:
+  --   * the top "Alertes par société" cards (Visa only per user spec)
+  --   * the VAMP Ratio numerator
+  SELECT conciergerie, psp, bucket, 'alerts_visa' AS metric,
     CAST(COUNT(DISTINCT transaction_id) AS FLOAT64) AS value
   FROM alerts_join
   WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL
@@ -1852,16 +1879,30 @@ UNION ALL SELECT * FROM alerts_metrics
 
 
 def _exec_period_bounds() -> tuple:
-    """Compute (s1_start, s1_end, s2_start, s2_end) client-side for labelling.
-    BQ uses the same logic via CURRENT_DATE() — both should match unless
-    crossing a midnight boundary between server-call and label rendering."""
+    """Compute (s1_start, s1_end, s2_start, s2_end) MTD windows for labelling.
+
+      - s1 = MTD courant : 1st of current month → yesterday
+      - s2 = MTD M-1     : 1st of previous month → same day-of-month as s1_end
+                          (clipped to last day of prev month if needed)
+
+    BQ uses the same logic via CURRENT_DATE() / DATE_SUB(... 1 MONTH) — both
+    should match unless crossing a midnight boundary between server-call and
+    label rendering."""
     today = date.today()
-    # Monday of current week (server-side: DATE_TRUNC ... WEEK(MONDAY))
-    current_monday = today - timedelta(days=today.weekday())
-    s1_end = current_monday - timedelta(days=1)         # last Sunday
-    s1_start = current_monday - timedelta(days=7)       # Monday of last week
-    s2_end = s1_start - timedelta(days=1)               # previous Sunday
-    s2_start = s1_start - timedelta(days=7)             # Monday of week before
+    s1_start = today.replace(day=1)
+    s1_end = today - timedelta(days=1)
+    # 1st of previous month
+    if s1_start.month == 1:
+        s2_start = date(s1_start.year - 1, 12, 1)
+    else:
+        s2_start = date(s1_start.year, s1_start.month - 1, 1)
+    # Same day-of-month as s1_end in prev month (clipped if shorter)
+    try:
+        s2_end = s2_start.replace(day=s1_end.day)
+    except ValueError:
+        # Prev month has fewer days — fall back to last day of prev month.
+        # (Last day = 1st of current month - 1 day.)
+        s2_end = s1_start - timedelta(days=1)
     return s1_start, s1_end, s2_start, s2_end
 
 
@@ -1911,11 +1952,11 @@ def render_exec_summary(df: pd.DataFrame) -> str:
             cls = "exec-wow-good" if is_good else "exec-wow-bad"
         return f"<span class='{cls}'>{sign}{pct*100:.1f}%</span>".replace(".", ",")
 
-    # --- Top: company cards (alerts S-1, WoW vs S-2) ---
+    # --- Top: company cards (Visa alerts MTD, WoW vs MTD M-1) ---
     cards = []
     for company, conciergeries in EXEC_COMPANIES:
-        s1 = sum(m(c, p, "s1", "alerts_all") for (c, p, _l) in EXEC_PSP_PAIRS if c in conciergeries)
-        s2 = sum(m(c, p, "s2", "alerts_all") for (c, p, _l) in EXEC_PSP_PAIRS if c in conciergeries)
+        s1 = sum(m(c, p, "s1", "alerts_visa") for (c, p, _l) in EXEC_PSP_PAIRS if c in conciergeries)
+        s2 = sum(m(c, p, "s2", "alerts_visa") for (c, p, _l) in EXEC_PSP_PAIRS if c in conciergeries)
         delta = wow_html(wow_pct(s1, s2), lower_is_better=True)
         # Sub-label: list of conciergeries inside
         sub = " · ".join(conciergeries)
@@ -1924,7 +1965,7 @@ def render_exec_summary(df: pd.DataFrame) -> str:
             f"<div class='exec-card-head'>{company}</div>"
             f"<div class='exec-card-sub'>{sub}</div>"
             f"<div class='exec-card-value'>{fr_int(s1)}</div>"
-            f"<div class='exec-card-foot'>alertes S-1 &middot; {delta} vs S-2</div>"
+            f"<div class='exec-card-foot'>alertes Visa MTD &middot; {delta} vs M-1</div>"
             "</div>"
         )
     cards_html = "<div class='exec-cards'>" + "".join(cards) + "</div>"
@@ -1964,10 +2005,11 @@ def render_exec_summary(df: pd.DataFrame) -> str:
         return None if brut == 0 else ref / brut
 
     def vamp_fn(c, p, b):
-        # VAMP all-R: alerts (by alerted_at) / succeeded tx (by t_date)
-        # R0 included on both sides per ELA spec
-        denom = m(c, p, b, "tx_succ_all")
-        num   = m(c, p, b, "alerts_all")
+        # VAMP Visa only: alerts (by alerted_at, cardnetwork='Visa')
+        #               / succeeded tx (by t_date, t_card_brand IN VISA, DELTA)
+        # R0 included on both sides. VAMP = Visa Acquirer Monitoring Program.
+        denom = m(c, p, b, "tx_succ_visa")
+        num   = m(c, p, b, "alerts_visa")
         return None if denom == 0 else num / denom
 
     rows_html = "".join([
@@ -1975,7 +2017,7 @@ def render_exec_summary(df: pd.DataFrame) -> str:
         kpi_row("€ CA Net",                fr_eur, lambda c, p, b: m(c, p, b, "brut") - m(c, p, b, "refund_rev"),    lower_is_better=False),
         kpi_row("% Churn R0→R1 (Booking)", fr_pct, churn_fn,                                                          lower_is_better=True),
         kpi_row("% Refund (CA)",           fr_pct, refund_fn,                                                         lower_is_better=True),
-        kpi_row("% VAMP Ratio",            fr_pct, vamp_fn,                                                           lower_is_better=True),
+        kpi_row("% VAMP Ratio (Visa)",     fr_pct, vamp_fn,                                                           lower_is_better=True),
     ])
 
     table_html = (
@@ -1988,8 +2030,8 @@ def render_exec_summary(df: pd.DataFrame) -> str:
     # Period label (client-side, same logic as BQ — matches unless tomorrow rolled over)
     s1_start, s1_end, s2_start, s2_end = _exec_period_bounds()
     period_label = (
-        f"<b>S-1 :</b> {s1_start.strftime('%d/%m')} → {s1_end.strftime('%d/%m')} "
-        f"&middot; <b>S-2 :</b> {s2_start.strftime('%d/%m')} → {s2_end.strftime('%d/%m')}"
+        f"<b>MTD courant :</b> {s1_start.strftime('%d/%m')} → {s1_end.strftime('%d/%m')} "
+        f"&middot; <b>MTD M-1 :</b> {s2_start.strftime('%d/%m')} → {s2_end.strftime('%d/%m')}"
     )
 
     css = """
@@ -2099,10 +2141,10 @@ def render_exec_summary(df: pd.DataFrame) -> str:
     return (
         css
         + "<div class='exec-summary'>"
-        + f"<div class='exec-period'>📅 {period_label} (semaines complètes lun→dim · indépendant des filtres de la sidebar)</div>"
-        + "<h3 class='exec-section'>Alertes par société — S-1 (hors Order Insight)</h3>"
+        + f"<div class='exec-period'>📅 {period_label} (Month-to-Date · indépendant des filtres de la sidebar)</div>"
+        + "<h3 class='exec-section'>Alertes Visa par société — MTD (hors Order Insight)</h3>"
         + cards_html
-        + "<h3 class='exec-section'>KPI hebdo par Conciergerie × PSP</h3>"
+        + "<h3 class='exec-section'>KPI MTD par Conciergerie × PSP</h3>"
         + table_html
         + "</div>"
     )
