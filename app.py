@@ -1600,6 +1600,476 @@ def style_table(df):
 
 
 # ---------------------------------------------------------------------------
+# Executive Summary tab — fixed window: last completed week (S-1) vs S-2.
+#
+# Independent from sidebar date range and dimensions. Filters are NOT applied
+# either (v1) — the table always reflects the full picture across the 7 fixed
+# (conciergerie × PSP) pairs.
+#
+# Layout:
+#   - Top: 5 cards (one per "company" — CT/Ray/RB/LM/NOV) with the S-1 alert
+#     count (any alert except Order Insight, which fact_alert already filters
+#     out) and the WoW evolution vs S-2.
+#   - Bot: KPI table — rows = R0, CA Net, % Churn R0→R1, % Refund, % VAMP ;
+#     cols = the 7 (conciergerie, PSP) pairs.
+# ---------------------------------------------------------------------------
+
+# Fixed (conciergerie, ms_default_psp, display label) pairs displayed in the
+# KPI table. PSPs are LOWERCASE to match ms_default_psp values in BigQuery.
+EXEC_PSP_PAIRS = [
+    ("Reserv-Go", "trustpayment", "Trustpayment"),
+    ("Book-Ici",  "trustpayment", "Trustpayment"),
+    ("Resadexa",  "trustpayment", "Trustpayment"),
+    ("Concimax",  "pixxles",      "Pixxles"),
+    ("Jumpaide",  "pixxles",      "Pixxles"),
+    ("Rapidoxy",  "pixxles",      "Pixxles"),
+    ("Rezaflash", "nmi",          "NMI"),
+]
+
+# Company rollup for the top alert cards.
+EXEC_COMPANIES = [
+    ("CT",  ["Reserv-Go", "Book-Ici", "Resadexa"]),
+    ("Ray", ["Jumpaide"]),
+    ("RB",  ["Concimax"]),
+    ("LM",  ["Rapidoxy"]),
+    ("NOV", ["Rezaflash"]),
+]
+
+
+def exec_summary_sql() -> str:
+    """Build SQL for the Executive Summary tab.
+
+    Returns rows of (conciergerie, psp, bucket, metric, value):
+      - conciergerie ∈ {Reserv-Go, Book-Ici, Resadexa, Rezaflash, Jumpaide,
+                        Concimax, Rapidoxy}
+      - psp = LOWER(ms_default_psp) (e.g. 'trustpayment', 'pixxles', 'nmi')
+      - bucket ∈ {'s1' (last completed Mon-Sun), 's2' (week before)}
+      - metric ∈ {r0, tbb_count, r1_net_count, brut, refund, tx_succ_no_r0,
+                  alerts_no_r0, alerts_all}
+      - value FLOAT64
+
+    Window is fixed (CURRENT_DATE() server-side). Ignores sidebar
+    date/dimensions/filters by design.
+
+    KPIs derived in Python from these atoms (see render_exec_summary):
+      - R0                = r0
+      - CA Net            = brut - refund
+      - % Churn R0→R1 net = 1 - (r1_net_count / tbb_count)
+      - % Refund          = refund / brut
+      - % VAMP Ratio      = alerts_no_r0 / tx_succ_no_r0
+    """
+    # Conciergerie canonical mapping — same logic as CONCIERGERIE_EXPR_FM/FT
+    # but inlined with the conciergerie names this tab cares about.
+    def _conc(alias: str, col: str) -> str:
+        return (
+            f"CASE LOWER(REGEXP_REPLACE(COALESCE({alias}.{col}, ''), r' - magazine$', '')) "
+            "  WHEN 'reserv-go'    THEN 'Reserv-Go' "
+            "  WHEN 'book-ici'     THEN 'Book-Ici' "
+            "  WHEN 'resadexa'     THEN 'Resadexa' "
+            "  WHEN 'rezaflash'    THEN 'Rezaflash' "
+            "  WHEN 'jumpaide.com' THEN 'Jumpaide' "
+            "  WHEN 'concimax'     THEN 'Concimax' "
+            "  WHEN 'rapidoxy'     THEN 'Rapidoxy' "
+            "  ELSE NULL END"
+        )
+
+    fm_conc = _conc("fm", "brand")
+    ft_conc = _conc("ft", "t_brand")
+    t_conc  = _conc("t",  "t_brand")
+
+    return f"""
+WITH weeks_def AS (
+  SELECT
+    DATE_SUB(DATE_TRUNC(CURRENT_DATE(), WEEK(MONDAY)), INTERVAL 7  DAY) AS s1_start,
+    DATE_SUB(DATE_TRUNC(CURRENT_DATE(), WEEK(MONDAY)), INTERVAL 1  DAY) AS s1_end,
+    DATE_SUB(DATE_TRUNC(CURRENT_DATE(), WEEK(MONDAY)), INTERVAL 14 DAY) AS s2_start,
+    DATE_SUB(DATE_TRUNC(CURRENT_DATE(), WEEK(MONDAY)), INTERVAL 8  DAY) AS s2_end
+),
+fm_in_window AS (
+  SELECT
+    fm.membership_id,
+    fm.ms_date,
+    fm.ms_trial_end,
+    fm.ms_default_psp AS psp,
+    COALESCE(fm.ms_cancelled_during_trial, FALSE) AS cancelled_during_trial,
+    {fm_conc} AS conciergerie
+  FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm
+  WHERE fm.ms_status NOT IN ('abandonned', 'processing')
+    AND (
+      (fm.ms_date       BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def))
+      OR (fm.ms_trial_end BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def))
+    )
+),
+r0 AS (
+  SELECT conciergerie, psp,
+    CASE
+      WHEN ms_date BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
+      WHEN ms_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s2_end FROM weeks_def) THEN 's2'
+    END AS bucket,
+    'r0' AS metric,
+    CAST(COUNT(DISTINCT membership_id) AS FLOAT64) AS value
+  FROM fm_in_window
+  WHERE conciergerie IS NOT NULL
+    AND ms_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
+  GROUP BY 1, 2, 3
+),
+tbb_cohort AS (
+  -- Cohort for Churn R0→R1: memberships whose TrialEnd falls in s1/s2
+  -- and that weren't cancelled during the trial (TBB = To Be Billed).
+  SELECT fm.conciergerie, fm.psp,
+    CASE
+      WHEN fm.ms_trial_end BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
+      WHEN fm.ms_trial_end BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s2_end FROM weeks_def) THEN 's2'
+    END AS bucket,
+    fm.membership_id,
+    MAX(IF(r1.membership_id IS NOT NULL, 1, 0)) AS has_r1_net
+  FROM fm_in_window fm
+  LEFT JOIN (
+    SELECT DISTINCT membership_id
+    FROM `eu-andy-marketing-raw.dashboard.fact_transactions`
+    WHERE invoice_r_index = '1'
+      AND transaction_status = 'succeeded'
+      AND is_refunded = FALSE
+      AND is_alerted = FALSE
+  ) r1 ON r1.membership_id = fm.membership_id
+  WHERE fm.conciergerie IS NOT NULL
+    AND fm.ms_trial_end BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
+    AND NOT fm.cancelled_during_trial
+  GROUP BY 1, 2, 3, 4
+),
+churn_agg AS (
+  SELECT conciergerie, psp, bucket, 'tbb_count' AS metric,
+    CAST(COUNT(*) AS FLOAT64) AS value
+  FROM tbb_cohort GROUP BY 1, 2, 3
+  UNION ALL
+  SELECT conciergerie, psp, bucket, 'r1_net_count' AS metric,
+    CAST(SUM(has_r1_net) AS FLOAT64) AS value
+  FROM tbb_cohort GROUP BY 1, 2, 3
+),
+ft_in_window AS (
+  SELECT
+    ft.transaction_id,
+    ft.t_date,
+    ft.transaction_amount,
+    ft.transaction_status,
+    ft.invoice_r_index,
+    ft.is_refunded,
+    ft.ms_default_psp AS psp,
+    {ft_conc} AS conciergerie,
+    CASE
+      WHEN ft.t_date BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
+      WHEN ft.t_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s2_end FROM weeks_def) THEN 's2'
+    END AS bucket
+  FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
+  WHERE ft.t_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
+),
+tx_metrics AS (
+  SELECT conciergerie, psp, bucket, 'brut' AS metric,
+    SUM(CASE WHEN transaction_status='succeeded' THEN transaction_amount ELSE 0 END) AS value
+  FROM ft_in_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+  UNION ALL
+  SELECT conciergerie, psp, bucket, 'refund' AS metric,
+    SUM(CASE WHEN is_refunded=TRUE THEN transaction_amount ELSE 0 END) AS value
+  FROM ft_in_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+  UNION ALL
+  SELECT conciergerie, psp, bucket, 'tx_succ_no_r0' AS metric,
+    CAST(COUNT(DISTINCT CASE WHEN transaction_status='succeeded' AND invoice_r_index != '0' THEN transaction_id END) AS FLOAT64) AS value
+  FROM ft_in_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+),
+alerts_join AS (
+  -- Each alert is joined to its underlying transaction to recover the
+  -- conciergerie / PSP / R-index (fact_alert doesn't keep t_brand). The
+  -- fact_alert VIEW already excludes Order Insight + Order Insight 3.0.
+  SELECT
+    fa.transaction_id, fa.alerted_at,
+    {t_conc} AS conciergerie,
+    t.ms_default_psp AS psp,
+    t.invoice_r_index,
+    CASE
+      WHEN fa.alerted_at BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
+      WHEN fa.alerted_at BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s2_end FROM weeks_def) THEN 's2'
+    END AS bucket
+  FROM `eu-andy-marketing-raw.dashboard.fact_alert` fa
+  JOIN `eu-andy-marketing-raw.dashboard.fact_transactions` t USING (transaction_id)
+  WHERE fa.alerted_at BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
+),
+alerts_metrics AS (
+  -- 'alerts_no_r0' = VAMP numerator (excludes R0 per the VAMP Ratio Notion def)
+  -- 'alerts_all'   = top-card numerator (every alert except OI, R0 included)
+  SELECT conciergerie, psp, bucket, 'alerts_no_r0' AS metric,
+    CAST(COUNT(DISTINCT transaction_id) AS FLOAT64) AS value
+  FROM alerts_join
+  WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL AND invoice_r_index != '0'
+  GROUP BY 1,2,3
+  UNION ALL
+  SELECT conciergerie, psp, bucket, 'alerts_all' AS metric,
+    CAST(COUNT(DISTINCT transaction_id) AS FLOAT64) AS value
+  FROM alerts_join
+  WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL
+  GROUP BY 1,2,3
+)
+SELECT * FROM r0
+UNION ALL SELECT conciergerie, psp, bucket, metric, value FROM churn_agg
+UNION ALL SELECT * FROM tx_metrics
+UNION ALL SELECT * FROM alerts_metrics
+"""
+
+
+def _exec_period_bounds() -> tuple:
+    """Compute (s1_start, s1_end, s2_start, s2_end) client-side for labelling.
+    BQ uses the same logic via CURRENT_DATE() — both should match unless
+    crossing a midnight boundary between server-call and label rendering."""
+    today = date.today()
+    # Monday of current week (server-side: DATE_TRUNC ... WEEK(MONDAY))
+    current_monday = today - timedelta(days=today.weekday())
+    s1_end = current_monday - timedelta(days=1)         # last Sunday
+    s1_start = current_monday - timedelta(days=7)       # Monday of last week
+    s2_end = s1_start - timedelta(days=1)               # previous Sunday
+    s2_start = s1_start - timedelta(days=7)             # Monday of week before
+    return s1_start, s1_end, s2_start, s2_end
+
+
+def render_exec_summary(df: pd.DataFrame) -> str:
+    """Render the Executive Summary as inline HTML (cards + KPI table)."""
+    if df.empty:
+        return "<div style='color:#64748b;padding:12px;'>Aucune donnée</div>"
+
+    # Pivot to dict for O(1) lookup: data[(conc, psp, bucket)][metric] = value
+    data: dict = {}
+    for _, r in df.iterrows():
+        key = (r["conciergerie"], r["psp"], r["bucket"])
+        try:
+            v = float(r["value"]) if pd.notna(r["value"]) else 0.0
+        except (TypeError, ValueError):
+            v = 0.0
+        data.setdefault(key, {})[r["metric"]] = v
+
+    def m(conc, psp, bucket, metric):
+        return data.get((conc, psp, bucket), {}).get(metric, 0.0)
+
+    # --- French number formatters ---
+    def fr_int(v):
+        return f"{int(round(v)):,}".replace(",", " ")
+
+    def fr_pct(v):
+        return f"{v*100:.1f}%".replace(".", ",")
+
+    def fr_eur(v):
+        if abs(v) >= 1000:
+            return f"{v/1000:,.1f} K€".replace(",", " ").replace(".", ",")
+        return f"{v:,.0f} €".replace(",", " ")
+
+    def wow_pct(curr, prev):
+        if prev is None or prev == 0 or curr is None:
+            return None
+        return (curr - prev) / prev
+
+    def wow_html(pct, lower_is_better=False):
+        if pct is None:
+            return "<span class='exec-wow-neutral'>—</span>"
+        sign = "+" if pct >= 0 else ""
+        is_good = (pct < 0) if lower_is_better else (pct > 0)
+        if pct == 0:
+            cls = "exec-wow-neutral"
+        else:
+            cls = "exec-wow-good" if is_good else "exec-wow-bad"
+        return f"<span class='{cls}'>{sign}{pct*100:.1f}%</span>".replace(".", ",")
+
+    # --- Top: company cards (alerts S-1, WoW vs S-2) ---
+    cards = []
+    for company, conciergeries in EXEC_COMPANIES:
+        s1 = sum(m(c, p, "s1", "alerts_all") for (c, p, _l) in EXEC_PSP_PAIRS if c in conciergeries)
+        s2 = sum(m(c, p, "s2", "alerts_all") for (c, p, _l) in EXEC_PSP_PAIRS if c in conciergeries)
+        delta = wow_html(wow_pct(s1, s2), lower_is_better=True)
+        # Sub-label: list of conciergeries inside
+        sub = " · ".join(conciergeries)
+        cards.append(
+            "<div class='exec-card'>"
+            f"<div class='exec-card-head'>{company}</div>"
+            f"<div class='exec-card-sub'>{sub}</div>"
+            f"<div class='exec-card-value'>{fr_int(s1)}</div>"
+            f"<div class='exec-card-foot'>alertes S-1 &middot; {delta} vs S-2</div>"
+            "</div>"
+        )
+    cards_html = "<div class='exec-cards'>" + "".join(cards) + "</div>"
+
+    # --- Bottom: KPI table ---
+    header_cells = "".join(
+        "<th>"
+        f"<div class='exec-th-conc'>{c}</div>"
+        f"<div class='exec-th-psp'>({lbl})</div>"
+        "</th>"
+        for (c, p, lbl) in EXEC_PSP_PAIRS
+    )
+
+    def kpi_row(label, fmt, compute_fn, lower_is_better=False):
+        cells = []
+        for (c, p, _lbl) in EXEC_PSP_PAIRS:
+            v1 = compute_fn(c, p, "s1")
+            v2 = compute_fn(c, p, "s2")
+            value_str = fmt(v1) if v1 is not None else "—"
+            delta_str = wow_html(wow_pct(v1, v2) if (v1 is not None and v2 is not None) else None,
+                                 lower_is_better=lower_is_better)
+            cells.append(
+                f"<td><div class='exec-cell-val'>{value_str}</div>"
+                f"<div class='exec-cell-wow'>{delta_str}</div></td>"
+            )
+        return f"<tr><td class='exec-kpi-label'>{label}</td>{''.join(cells)}</tr>"
+
+    def churn_fn(c, p, b):
+        tbb = m(c, p, b, "tbb_count")
+        r1  = m(c, p, b, "r1_net_count")
+        return None if tbb == 0 else 1 - (r1 / tbb)
+
+    def refund_fn(c, p, b):
+        brut = m(c, p, b, "brut")
+        ref  = m(c, p, b, "refund")
+        return None if brut == 0 else ref / brut
+
+    def vamp_fn(c, p, b):
+        denom = m(c, p, b, "tx_succ_no_r0")
+        num   = m(c, p, b, "alerts_no_r0")
+        return None if denom == 0 else num / denom
+
+    rows_html = "".join([
+        kpi_row("# R0",                fr_int, lambda c, p, b: m(c, p, b, "r0"),                         lower_is_better=False),
+        kpi_row("€ CA Net",            fr_eur, lambda c, p, b: m(c, p, b, "brut") - m(c, p, b, "refund"), lower_is_better=False),
+        kpi_row("% Churn R0→R1 net",   fr_pct, churn_fn,                                                  lower_is_better=True),
+        kpi_row("% Refund",            fr_pct, refund_fn,                                                 lower_is_better=True),
+        kpi_row("% VAMP Ratio",        fr_pct, vamp_fn,                                                   lower_is_better=True),
+    ])
+
+    table_html = (
+        "<table class='exec-table'>"
+        f"<thead><tr><th class='exec-kpi-label'>KPI</th>{header_cells}</tr></thead>"
+        f"<tbody>{rows_html}</tbody>"
+        "</table>"
+    )
+
+    # Period label (client-side, same logic as BQ — matches unless tomorrow rolled over)
+    s1_start, s1_end, s2_start, s2_end = _exec_period_bounds()
+    period_label = (
+        f"<b>S-1 :</b> {s1_start.strftime('%d/%m')} → {s1_end.strftime('%d/%m')} "
+        f"&middot; <b>S-2 :</b> {s2_start.strftime('%d/%m')} → {s2_end.strftime('%d/%m')}"
+    )
+
+    css = """
+    <style>
+      .exec-summary { font-size: 14px; }
+      .exec-period {
+        background: #fef3c7;
+        border-left: 4px solid #f59e0b;
+        padding: 8px 12px;
+        border-radius: 4px;
+        margin-bottom: 16px;
+        font-size: 13px;
+      }
+      .exec-section {
+        font-size: 16px;
+        font-weight: 700;
+        color: #0f172a;
+        margin: 20px 0 10px 0;
+        padding-bottom: 6px;
+        border-bottom: 2px solid #e2e8f0;
+      }
+      .exec-cards {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 12px;
+        margin-bottom: 8px;
+      }
+      .exec-card {
+        background: white;
+        border: 1px solid #cbd5e1;
+        border-radius: 8px;
+        padding: 14px 16px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+      }
+      .exec-card-head {
+        font-size: 12px;
+        font-weight: 700;
+        text-transform: uppercase;
+        color: #475569;
+        letter-spacing: 0.05em;
+      }
+      .exec-card-sub {
+        font-size: 11px;
+        color: #94a3b8;
+        margin-top: 2px;
+        margin-bottom: 8px;
+      }
+      .exec-card-value {
+        font-size: 30px;
+        font-weight: 700;
+        color: #0f172a;
+        line-height: 1.1;
+      }
+      .exec-card-foot {
+        font-size: 12px;
+        color: #64748b;
+        margin-top: 6px;
+      }
+      .exec-table {
+        border-collapse: separate;
+        border-spacing: 0;
+        width: 100%;
+        background: white;
+        border: 1px solid #cbd5e1;
+        border-radius: 8px;
+        overflow: hidden;
+        font-size: 13px;
+      }
+      .exec-table thead th {
+        background: #0f172a;
+        color: white;
+        padding: 10px 12px;
+        text-align: center;
+        font-weight: 600;
+        border-bottom: 2px solid #1e293b;
+      }
+      .exec-table thead th.exec-kpi-label {
+        text-align: left;
+        background: #1e293b;
+      }
+      .exec-th-conc { font-size: 13px; font-weight: 700; }
+      .exec-th-psp  { font-size: 11px; opacity: 0.75; font-weight: 400; margin-top: 2px; }
+      .exec-table tbody td {
+        padding: 10px 12px;
+        text-align: center;
+        border-bottom: 1px solid #e2e8f0;
+        vertical-align: middle;
+      }
+      .exec-table tbody tr:last-child td { border-bottom: none; }
+      .exec-table tbody tr:nth-child(even) td { background: #f8fafc; }
+      .exec-kpi-label {
+        text-align: left !important;
+        font-weight: 700;
+        color: #0f172a;
+        background: #f1f5f9 !important;
+        position: sticky;
+        left: 0;
+      }
+      .exec-cell-val { font-size: 14px; font-weight: 600; color: #0f172a; }
+      .exec-cell-wow { font-size: 11px; margin-top: 3px; }
+      .exec-wow-good    { color: #059669; font-weight: 600; }
+      .exec-wow-bad     { color: #dc2626; font-weight: 600; }
+      .exec-wow-neutral { color: #94a3b8; }
+    </style>
+    """
+
+    return (
+        css
+        + "<div class='exec-summary'>"
+        + f"<div class='exec-period'>📅 {period_label} (semaines complètes lun→dim · indépendant des filtres de la sidebar)</div>"
+        + "<h3 class='exec-section'>Alertes par société — S-1 (hors Order Insight)</h3>"
+        + cards_html
+        + "<h3 class='exec-section'>KPI hebdo par Conciergerie × PSP</h3>"
+        + table_html
+        + "</div>"
+    )
+
+
+# ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 st.title("📊 Weekly PSP Report")
@@ -1722,7 +2192,19 @@ header_html = f"""
 st.markdown(header_html, unsafe_allow_html=True)
 
 # Tabs
-tab_b, tab_m, tab_vc, tab_vd = st.tabs(["Funnel Booking", "Funnel Magazine", "VAMP Cohort", "VAMP Date"])
+tab_exec, tab_b, tab_m, tab_vc, tab_vd = st.tabs(
+    ["Executive Summary", "Funnel Booking", "Funnel Magazine", "VAMP Cohort", "VAMP Date"]
+)
+
+with tab_exec:
+    # Independent from sidebar — always shows last completed week (S-1)
+    # vs the week before (S-2). Filters/dimensions/date range NOT applied.
+    with st.spinner("Executive Summary…"):
+        try:
+            df_exec = run_query(exec_summary_sql())
+            st.markdown(render_exec_summary(df_exec), unsafe_allow_html=True)
+        except Exception as e:
+            st.error(f"Erreur Executive Summary : {e}")
 
 with tab_b:
     with st.spinner("Funnel Booking…"):
