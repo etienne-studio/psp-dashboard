@@ -191,12 +191,13 @@ FILTER_DIMS = [
     # If the spec contains "{alias}" it is treated as a raw SQL expression
     # (alias substituted with fm/ft); otherwise it's a plain column name.
     # Expressions are rewired just below DIMENSION_DIMS (after they are defined).
-    ("conciergerie",   "Conciergerie",  "PLACEHOLDER",     "PLACEHOLDER"),
-    ("verticale",      "Verticale",     "sgw_verticale",   "sgw_verticale"),
-    ("psp",            "PSP",           "ms_default_psp",  "ms_default_psp"),
-    ("currency",       "Devise",        "ms_currency",     "ms_currency"),
-    ("price_booking",  "Prix Booking",  "PLACEHOLDER",     "PLACEHOLDER"),
-    ("price_magazine", "Prix Magazine", "PLACEHOLDER",     "PLACEHOLDER"),
+    ("conciergerie",    "Conciergerie",    "PLACEHOLDER",        "PLACEHOLDER"),
+    ("verticale",       "Verticale",       "sgw_verticale",      "sgw_verticale"),
+    ("psp",             "PSP",             "ms_default_psp",     "ms_default_psp"),
+    ("currency",        "Devise",          "ms_currency",        "ms_currency"),
+    ("booking_market",  "Marché Booking",  "sgw_booking_market", "sgw_booking_market"),
+    ("price_booking",   "Prix Booking",    "PLACEHOLDER",        "PLACEHOLDER"),
+    ("price_magazine",  "Prix Magazine",   "PLACEHOLDER",        "PLACEHOLDER"),
 ]
 
 
@@ -1153,23 +1154,40 @@ ORDER BY w.week_start, {dim_cols_trailing(dims, "da") if has_nw else ""}cat
 """
 
 
-def filter_options_sql() -> str:
-    """Pull distinct values for each filter dimension from fact_memberships (80-day window)."""
+def filter_options_sql(start: date = None, end: date = None) -> str:
+    """Pull distinct values for each filter dimension from fact_memberships
+    over the user-selected date range (or fall back to 80 days if no range
+    provided).
+
+    The window matches what `funnel_sql` / `vamp_*_sql` actually query, so
+    the sidebar can't propose a value that has no data — and (critically)
+    can't HIDE a value that does have data in the selected range. Without
+    this, picking a date range outside the default 80-day window would make
+    historical PSPs like `quaife` invisible in the filter dropdown.
+    """
     booking_bucket = BOOKING_PRICE_EXPR.format(alias="fm")
     magazine_bucket = MAGAZINE_PRICE_EXPR.format(alias="fm")
     conciergerie = CONCIERGERIE_EXPR_FM.format(alias="fm")
+    # Build window bounds — fall back to last 80 days if no range provided.
+    if start and end:
+        ws_min = f"DATE '{start.isoformat()}'"
+        ws_max = f"DATE '{end.isoformat()}'"
+    else:
+        ws_min = "DATE_SUB(CURRENT_DATE(), INTERVAL 80 DAY)"
+        ws_max = "CURRENT_DATE()"
     return f"""
 WITH wb AS (
-  SELECT DATE_SUB(CURRENT_DATE(), INTERVAL 80 DAY) AS ws_min, CURRENT_DATE() AS ws_max
+  SELECT {ws_min} AS ws_min, {ws_max} AS ws_max
 ),
 fm_recent AS (
   SELECT
-    COALESCE(fm.ms_default_psp,  '') AS psp,
-    COALESCE({conciergerie},     '') AS conciergerie,
-    COALESCE(fm.sgw_verticale,   '') AS verticale,
-    COALESCE(fm.ms_currency,     '') AS currency,
-    COALESCE({booking_bucket},   '') AS price_booking,
-    COALESCE({magazine_bucket},  '') AS price_magazine
+    COALESCE(fm.ms_default_psp,     '') AS psp,
+    COALESCE({conciergerie},        '') AS conciergerie,
+    COALESCE(fm.sgw_verticale,      '') AS verticale,
+    COALESCE(fm.ms_currency,        '') AS currency,
+    COALESCE(fm.sgw_booking_market, '') AS booking_market,
+    COALESCE({booking_bucket},      '') AS price_booking,
+    COALESCE({magazine_bucket},     '') AS price_magazine
   FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm
   CROSS JOIN wb
   WHERE DATE(fm.ms_datetime) BETWEEN wb.ws_min AND wb.ws_max
@@ -1179,7 +1197,7 @@ fm_recent AS (
     AND LOWER(fm.customer_firstname) NOT LIKE '%test%'
 )
 SELECT dim, val, COUNT(*) AS n FROM fm_recent
-UNPIVOT (val FOR dim IN (psp, conciergerie, verticale, currency, price_booking, price_magazine))
+UNPIVOT (val FOR dim IN (psp, conciergerie, verticale, currency, booking_market, price_booking, price_magazine))
 WHERE NOT (dim IN ('price_booking', 'price_magazine') AND val = '')
 GROUP BY 1,2
 ORDER BY 1, 3 DESC
@@ -1656,10 +1674,12 @@ st.sidebar.caption(f"{len(weeks_list)} {_period_word}{'s' if len(weeks_list) > 1
 st.sidebar.divider()
 
 # Sidebar: filters
+# Filter options are scoped to the user-selected date range so the dropdown
+# proposes exactly the values that exist in the data the user is looking at.
 st.sidebar.header("Filtres")
 with st.spinner("Chargement des options de filtre…"):
     try:
-        opts_df = run_query(filter_options_sql())
+        opts_df = run_query(filter_options_sql(_picked_start, _picked_end))
     except Exception as e:
         st.sidebar.error(f"Échec chargement filtres : {e}")
         opts_df = pd.DataFrame(columns=["dim", "val", "n"])
