@@ -1652,11 +1652,19 @@ def exec_summary_sql() -> str:
     date/dimensions/filters by design.
 
     KPIs derived in Python from these atoms (see render_exec_summary):
-      - R0                = r0
-      - CA Net            = brut - refund
-      - % Churn R0→R1 net = 1 - (r1_net_count / tbb_count)
-      - % Refund          = refund / brut
-      - % VAMP Ratio      = alerts_no_r0 / tx_succ_no_r0
+      - R0                = r0                  (customer-level count, not membership)
+      - CA Net            = brut - refund_revenue (brut by t_date; refund by refunded_at_utc)
+      - % Churn R0→R1 net = 1 - (r1_net_count / tbb_count)  (Booking ONLY)
+      - % Refund          = refund_revenue / brut   (CA-based, dates differentiated)
+      - % VAMP Ratio      = alerts_all / tx_succ_all  (ALL R indexes, R0 included)
+
+    Date semantics:
+      - r0          : by ms_date (signup date)
+      - tbb_cohort  : by ms_trial_end (cohort that should have been billed in week)
+      - brut        : by t_date (transaction date) for status='succeeded' tx
+      - refund_rev  : by refunded_at_utc (refund date), independent of t_date
+      - tx_succ_all : by t_date (transaction date)
+      - alerts_all  : by alerted_at (alert date), independent of t_date
     """
     # Conciergerie canonical mapping — same logic as CONCIERGERIE_EXPR_FM/FT
     # but inlined with the conciergerie names this tab cares about.
@@ -1688,6 +1696,8 @@ WITH weeks_def AS (
 fm_in_window AS (
   SELECT
     fm.membership_id,
+    fm.customer_id,
+    fm.brand_type,
     fm.ms_date,
     fm.ms_trial_end,
     fm.ms_default_psp AS psp,
@@ -1701,13 +1711,16 @@ fm_in_window AS (
     )
 ),
 r0 AS (
+  -- R0 = nombre de CUSTOMERS uniques signés up dans la semaine (et pas
+  -- de memberships : un customer qui a 2 subs au sein de la même semaine
+  -- (Booking + Magazine ou re-signup) compte une seule fois).
   SELECT conciergerie, psp,
     CASE
       WHEN ms_date BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
       WHEN ms_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s2_end FROM weeks_def) THEN 's2'
     END AS bucket,
     'r0' AS metric,
-    CAST(COUNT(DISTINCT membership_id) AS FLOAT64) AS value
+    CAST(COUNT(DISTINCT customer_id) AS FLOAT64) AS value
   FROM fm_in_window
   WHERE conciergerie IS NOT NULL
     AND ms_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
@@ -1716,6 +1729,9 @@ r0 AS (
 tbb_cohort AS (
   -- Cohort for Churn R0→R1: memberships whose TrialEnd falls in s1/s2
   -- and that weren't cancelled during the trial (TBB = To Be Billed).
+  -- BOOKING ONLY — the churn measured here is the conversion of the
+  -- Booking sub from trial to billed. Magazine cross-sells have their
+  -- own dynamic and shouldn't pollute this number.
   SELECT fm.conciergerie, fm.psp,
     CASE
       WHEN fm.ms_trial_end BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
@@ -1731,8 +1747,10 @@ tbb_cohort AS (
       AND transaction_status = 'succeeded'
       AND is_refunded = FALSE
       AND is_alerted = FALSE
+      AND brand_type = 'Booking'
   ) r1 ON r1.membership_id = fm.membership_id
   WHERE fm.conciergerie IS NOT NULL
+    AND fm.brand_type = 'Booking'
     AND fm.ms_trial_end BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
     AND NOT fm.cancelled_during_trial
   GROUP BY 1, 2, 3, 4
@@ -1747,13 +1765,14 @@ churn_agg AS (
   FROM tbb_cohort GROUP BY 1, 2, 3
 ),
 ft_in_window AS (
+  -- Transactions by t_date (transaction date) — used for brut revenue and
+  -- VAMP denominator. Includes ALL R indexes (R0 + R1..R4 + Cx + micros).
   SELECT
     ft.transaction_id,
     ft.t_date,
     ft.transaction_amount,
     ft.transaction_status,
     ft.invoice_r_index,
-    ft.is_refunded,
     ft.ms_default_psp AS psp,
     {ft_conc} AS conciergerie,
     CASE
@@ -1763,17 +1782,38 @@ ft_in_window AS (
   FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
   WHERE ft.t_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
 ),
+refund_in_window AS (
+  -- Refunds by refunded_at_utc (refund processing date) — independent of
+  -- the original transaction date. A tx originated in week N-3 but refunded
+  -- in week N-1 lands in N-1 here. transaction_amount = original tx amount
+  -- (per Notion '€ Refund' convention).
+  SELECT
+    ft.transaction_id,
+    ft.transaction_amount,
+    ft.ms_default_psp AS psp,
+    {ft_conc} AS conciergerie,
+    CASE
+      WHEN ft.refunded_at_utc BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
+      WHEN ft.refunded_at_utc BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s2_end FROM weeks_def) THEN 's2'
+    END AS bucket
+  FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
+  WHERE ft.is_refunded = TRUE
+    AND ft.refunded_at_utc BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
+),
 tx_metrics AS (
+  -- 'brut'        : € of succeeded tx by t_date (all R indexes)
+  -- 'refund_rev'  : € of refunds by refunded_at_utc (all R indexes)
+  -- 'tx_succ_all' : # of succeeded tx by t_date (all R indexes — VAMP denom)
   SELECT conciergerie, psp, bucket, 'brut' AS metric,
     SUM(CASE WHEN transaction_status='succeeded' THEN transaction_amount ELSE 0 END) AS value
   FROM ft_in_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
   UNION ALL
-  SELECT conciergerie, psp, bucket, 'refund' AS metric,
-    SUM(CASE WHEN is_refunded=TRUE THEN transaction_amount ELSE 0 END) AS value
-  FROM ft_in_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+  SELECT conciergerie, psp, bucket, 'refund_rev' AS metric,
+    SUM(transaction_amount) AS value
+  FROM refund_in_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
   UNION ALL
-  SELECT conciergerie, psp, bucket, 'tx_succ_no_r0' AS metric,
-    CAST(COUNT(DISTINCT CASE WHEN transaction_status='succeeded' AND invoice_r_index != '0' THEN transaction_id END) AS FLOAT64) AS value
+  SELECT conciergerie, psp, bucket, 'tx_succ_all' AS metric,
+    CAST(COUNT(DISTINCT CASE WHEN transaction_status='succeeded' THEN transaction_id END) AS FLOAT64) AS value
   FROM ft_in_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
 ),
 alerts_join AS (
@@ -1794,14 +1834,10 @@ alerts_join AS (
   WHERE fa.alerted_at BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
 ),
 alerts_metrics AS (
-  -- 'alerts_no_r0' = VAMP numerator (excludes R0 per the VAMP Ratio Notion def)
-  -- 'alerts_all'   = top-card numerator (every alert except OI, R0 included)
-  SELECT conciergerie, psp, bucket, 'alerts_no_r0' AS metric,
-    CAST(COUNT(DISTINCT transaction_id) AS FLOAT64) AS value
-  FROM alerts_join
-  WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL AND invoice_r_index != '0'
-  GROUP BY 1,2,3
-  UNION ALL
+  -- 'alerts_all' = every alert (R0 + Rx), by alerted_at, with Order Insight
+  -- already filtered out at the fact_alert VIEW level. Used by both:
+  --   * the top "Alertes par société" cards
+  --   * the VAMP Ratio numerator (per user request, R0 included)
   SELECT conciergerie, psp, bucket, 'alerts_all' AS metric,
     CAST(COUNT(DISTINCT transaction_id) AS FLOAT64) AS value
   FROM alerts_join
@@ -1922,21 +1958,24 @@ def render_exec_summary(df: pd.DataFrame) -> str:
         return None if tbb == 0 else 1 - (r1 / tbb)
 
     def refund_fn(c, p, b):
+        # CA-based refund rate: € refunded (by refund_at_utc) / € brut (by t_date)
         brut = m(c, p, b, "brut")
-        ref  = m(c, p, b, "refund")
+        ref  = m(c, p, b, "refund_rev")
         return None if brut == 0 else ref / brut
 
     def vamp_fn(c, p, b):
-        denom = m(c, p, b, "tx_succ_no_r0")
-        num   = m(c, p, b, "alerts_no_r0")
+        # VAMP all-R: alerts (by alerted_at) / succeeded tx (by t_date)
+        # R0 included on both sides per ELA spec
+        denom = m(c, p, b, "tx_succ_all")
+        num   = m(c, p, b, "alerts_all")
         return None if denom == 0 else num / denom
 
     rows_html = "".join([
-        kpi_row("# R0",                fr_int, lambda c, p, b: m(c, p, b, "r0"),                         lower_is_better=False),
-        kpi_row("€ CA Net",            fr_eur, lambda c, p, b: m(c, p, b, "brut") - m(c, p, b, "refund"), lower_is_better=False),
-        kpi_row("% Churn R0→R1 net",   fr_pct, churn_fn,                                                  lower_is_better=True),
-        kpi_row("% Refund",            fr_pct, refund_fn,                                                 lower_is_better=True),
-        kpi_row("% VAMP Ratio",        fr_pct, vamp_fn,                                                   lower_is_better=True),
+        kpi_row("# R0 (customers)",        fr_int, lambda c, p, b: m(c, p, b, "r0"),                                lower_is_better=False),
+        kpi_row("€ CA Net",                fr_eur, lambda c, p, b: m(c, p, b, "brut") - m(c, p, b, "refund_rev"),    lower_is_better=False),
+        kpi_row("% Churn R0→R1 (Booking)", fr_pct, churn_fn,                                                          lower_is_better=True),
+        kpi_row("% Refund (CA)",           fr_pct, refund_fn,                                                         lower_is_better=True),
+        kpi_row("% VAMP Ratio",            fr_pct, vamp_fn,                                                           lower_is_better=True),
     ])
 
     table_html = (
