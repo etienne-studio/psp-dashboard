@@ -1402,6 +1402,333 @@ def build_funnel_table(df: pd.DataFrame, brand_type: str, dims: list) -> pd.Data
     return out
 
 
+# ---------------------------------------------------------------------------
+# Funnel graph — same data as build_funnel_table but pivoted for plotting.
+#
+# Each "point" on the graph = one (time bucket, curve dim value) cell, which
+# is exactly one cohort. We aggregate the funnel_sql raw output the same way
+# build_funnel_table does (one row per rx_idx per cohort), then compute every
+# KPI per cell. The result is a tidy long DataFrame ready for a Plotly chart:
+#
+#   time | time_label | curve | kpi | value
+#
+# - time          : pd.Timestamp / date (X axis)
+# - time_label    : human-readable ('S20 (11/05)', '15/05/2026', 'Mai 2026')
+# - curve         : dim value of the curve split (or 'Total' if no curve dim)
+# - kpi           : KPI label, same naming as in build_funnel_table rows
+# - value         : raw float / int (None if undefined — e.g. div by 0)
+#
+# Ratio KPIs are computed PER CELL (= same as the table cell). No further
+# aggregation — what the user sees on a graph point matches exactly what
+# they'd see in the equivalent cell of the table.
+# ---------------------------------------------------------------------------
+
+# Ordered list of all KPIs the funnel exposes. Used to populate the radio
+# list in the order users expect (matches build_funnel_table sections).
+ALL_FUNNEL_KPIS = [
+    # R0
+    "# R0 Attempts",
+    "% Success Rate R0",
+    "# R0 Succeeded",
+    "% Unsub During Trial",
+    "# R1 To Be Billed",
+    "% R1 Billed",
+    # R1
+    "# R1 First Attempt (users)",
+    "% Success R1 First Attempt",
+    "# R1 Attempts (tx dedup)",
+    "% Success R1 Attempts",
+    "# R1 Succeeded (users)",
+    "% R1 Succeeded per User",
+    "% Churn Brut R0/R1",
+    "# Refund R1",
+    "% Refund R1",
+    "% Churn Net R0/R1",
+    # R2..R4 — generated below
+]
+for _rx in ["2", "3", "4"]:
+    _prev = str(int(_rx) - 1)
+    _lbl = f"R{_rx}"
+    ALL_FUNNEL_KPIS += [
+        f"# {_lbl} To Be Billed",
+        f"% {_lbl} Billed",
+        f"# {_lbl} First Attempt (users)",
+        f"% Success {_lbl} First Attempt",
+        f"# {_lbl} Attempts (tx dedup)",
+        f"% Success {_lbl} Attempts",
+        f"# {_lbl} Succeeded (users)",
+        f"% {_lbl} Succeeded per User",
+        f"% Churn Brut R{_prev}/{_lbl}",
+        f"# Refund {_lbl}",
+        f"% Refund {_lbl}",
+        f"% Churn Net R{_prev}/{_lbl}",
+    ]
+
+
+def funnel_graph_data(df: pd.DataFrame, time_dim_key: str, curve_dim_key: str | None) -> pd.DataFrame:
+    """Aggregate raw funnel df → tidy long DataFrame for plotting.
+
+    Mirrors build_funnel_table's aggregation but with the (cell = cohort)
+    semantics since dims = [time, curve]: each cell aggregates the 5 rx_idx
+    rows of ONE cohort, cohort-level fields counted once, per-rx fields
+    summed.
+
+    Args:
+      df            : raw BQ output from funnel_sql(brand_type, ..., dims=[time, curve])
+      time_dim_key  : 'date_day' | 'date_week' | 'date_month'
+      curve_dim_key : DIMENSION_DIMS key for the curve, or None (single 'Total')
+
+    Returns: tidy DataFrame (time, time_label, curve, kpi, value).
+    """
+    if df.empty:
+        return pd.DataFrame(columns=["time", "time_label", "curve", "kpi", "value"])
+
+    # Pre-parse week_start to a sortable date (BQ returns ISO string).
+    def _parse_time(s):
+        if pd.isna(s):
+            return None
+        try:
+            return pd.to_datetime(s).date()
+        except Exception:
+            return s
+
+    cells: dict = {}  # key = (time, curve), value = agg dict
+    cell_labels: dict = {}  # key = (time, curve), value = time_label
+
+    for _, r in df.iterrows():
+        t_key = _parse_time(r["week_start"])
+        t_label = r["week_label"]
+        c_val = _safe_str(r.get(f"dim_{curve_dim_key}", "")) if curve_dim_key else "Total"
+        if c_val == "":
+            c_val = "(empty)"
+        key = (t_key, c_val)
+
+        if key not in cells:
+            cells[key] = {
+                "r0_attempts": 0, "r0_succeeded": 0, "unsub_trial": 0, "r1_tbb": 0,
+                "rx": {},
+                "_cohort_counted": False,
+            }
+            cell_labels[key] = t_label
+
+        # Cohort-level — count once per cell (each cell IS one cohort here).
+        if not cells[key]["_cohort_counted"]:
+            cells[key]["_cohort_counted"] = True
+            cells[key]["r0_attempts"] += int(r["r0_attempts"])
+            cells[key]["r0_succeeded"] += int(r["r0_succeeded"])
+            cells[key]["unsub_trial"] += int(r["unsub_trial"])
+            cells[key]["r1_tbb"] += int(r["r1_tbb"])
+
+        # Per-rx — accumulate.
+        rx = str(r["rx_idx"])
+        acc = cells[key]["rx"].setdefault(rx, {
+            "fa_u": 0, "fa_tx": 0, "fa_succ_tx": 0,
+            "total_tx": 0, "succ_tx": 0,
+            "att_u": 0, "succ_u": 0,
+            "refund_tx": 0, "refund_u": 0,
+            "elig_u": 0, "cancel_u": 0,
+        })
+        acc["fa_u"] += int(r["first_attempt_users"])
+        acc["fa_tx"] += int(r["first_attempt_tx"])
+        acc["fa_succ_tx"] += int(r["first_attempt_succ_tx"])
+        acc["total_tx"] += int(r["total_tx"])
+        acc["succ_tx"] += int(r["succ_tx"])
+        acc["att_u"] += int(r["attempted_users"])
+        acc["succ_u"] += int(r["succ_users"])
+        acc["refund_tx"] += int(r["refund_tx"])
+        acc["refund_u"] += int(r["refund_users"])
+        acc["elig_u"] += int(r["tbb_elig_users"])
+        acc["cancel_u"] += int(r["tbb_cancel_users"])
+        acc["tbb"] = max(acc["elig_u"] - acc["cancel_u"], 0)
+
+    def _ratio(num, denom):
+        if denom is None or denom == 0:
+            return None
+        return num / denom
+
+    rows = []
+    for (t_key, c_val), agg in cells.items():
+        def g0(k, _agg=agg):
+            return _agg.get(k, 0)
+
+        def gr(rx, k, _agg=agg):
+            return _agg["rx"].get(rx, {}).get(k, 0)
+
+        kpis = {
+            "# R0 Attempts":            g0("r0_attempts"),
+            "% Success Rate R0":        _ratio(g0("r0_succeeded"), g0("r0_attempts")),
+            "# R0 Succeeded":           g0("r0_succeeded"),
+            "% Unsub During Trial":     _ratio(g0("unsub_trial"), g0("r0_succeeded")),
+            "# R1 To Be Billed":        g0("r1_tbb"),
+            "% R1 Billed":              _ratio(gr("1", "fa_u"), g0("r1_tbb")),
+            # R1
+            "# R1 First Attempt (users)":   gr("1", "fa_u"),
+            "% Success R1 First Attempt":   _ratio(gr("1", "fa_succ_tx"), gr("1", "fa_tx")),
+            "# R1 Attempts (tx dedup)":     gr("1", "total_tx"),
+            "% Success R1 Attempts":        _ratio(gr("1", "succ_tx"), gr("1", "total_tx")),
+            "# R1 Succeeded (users)":       gr("1", "succ_u"),
+            "% R1 Succeeded per User":      _ratio(gr("1", "succ_u"), gr("1", "att_u")),
+            "% Churn Brut R0/R1":           _ratio(g0("r0_succeeded") - gr("1", "succ_u"), g0("r0_succeeded")),
+            "# Refund R1":                  gr("1", "refund_tx"),
+            "% Refund R1":                  _ratio(gr("1", "refund_tx"), gr("1", "succ_tx")),
+            "% Churn Net R0/R1":            _ratio(
+                g0("r0_succeeded") - (gr("1", "succ_u") - gr("1", "refund_u")),
+                g0("r0_succeeded")),
+        }
+        # R2 / R3 / R4 — same formulas as in build_funnel_table.
+        for rx in ["2", "3", "4"]:
+            prev = str(int(rx) - 1)
+            lbl = f"R{rx}"
+            if gr(rx, "elig_u") == 0:
+                # Skip this rx for this cell — KPIs not defined yet (no eligible)
+                continue
+            kpis[f"# {lbl} To Be Billed"]          = gr(rx, "tbb")
+            kpis[f"% {lbl} Billed"]                = _ratio(gr(rx, "fa_u"), gr(rx, "tbb"))
+            kpis[f"# {lbl} First Attempt (users)"] = gr(rx, "fa_u")
+            kpis[f"% Success {lbl} First Attempt"] = _ratio(gr(rx, "fa_succ_tx"), gr(rx, "fa_tx"))
+            kpis[f"# {lbl} Attempts (tx dedup)"]   = gr(rx, "total_tx")
+            kpis[f"% Success {lbl} Attempts"]      = _ratio(gr(rx, "succ_tx"), gr(rx, "total_tx"))
+            kpis[f"# {lbl} Succeeded (users)"]     = gr(rx, "succ_u")
+            kpis[f"% {lbl} Succeeded per User"]    = _ratio(gr(rx, "succ_u"), gr(rx, "att_u"))
+            kpis[f"% Churn Brut R{prev}/{lbl}"]    = _ratio(gr(prev, "succ_u") - gr(rx, "succ_u"), gr(prev, "succ_u"))
+            kpis[f"# Refund {lbl}"]                = gr(rx, "refund_tx")
+            kpis[f"% Refund {lbl}"]                = _ratio(gr(rx, "refund_tx"), gr(rx, "succ_tx"))
+            kpis[f"% Churn Net R{prev}/{lbl}"]     = _ratio(
+                gr(prev, "succ_u") - (gr(rx, "succ_u") - gr(rx, "refund_u")),
+                gr(prev, "succ_u"))
+
+        t_label = cell_labels[(t_key, c_val)]
+        for kpi_name, val in kpis.items():
+            rows.append({
+                "time": t_key,
+                "time_label": t_label,
+                "curve": c_val,
+                "kpi": kpi_name,
+                "value": val,
+            })
+
+    return pd.DataFrame(rows)
+
+
+def render_funnel_graph(brand_type: str, filters: dict, picked_start, picked_end, key_prefix: str) -> None:
+    """Render the "Évolution dans le temps" graph section under a funnel tab.
+
+    Independent from sidebar dims / granularity (own selectors below). Reuses
+    sidebar filters + picked date range. Streamlit widgets get a unique key
+    prefix so we can have one graph per tab without state collision.
+    """
+    import plotly.express as px  # lazy import — only when graph is rendered
+
+    st.markdown("### 📈 Évolution dans le temps")
+
+    ctrl1, ctrl2, _spacer = st.columns([1.5, 1.5, 4])
+    time_options = ["Date (jour)", "Date (semaine)", "Date (mois)"]
+    graph_time_label = ctrl1.selectbox(
+        "Granularité X",
+        options=time_options,
+        index=1,  # Semaine par défaut
+        key=f"{key_prefix}_graph_time",
+        help="Granularité de l'axe X (indépendant de la sidebar)",
+    )
+    # Curve dim options : exclude date dims (those go on X)
+    _NONE_GRAPH = "— aucune (agrégé) —"
+    curve_options = [_NONE_GRAPH] + [d[1] for d in DIMENSION_DIMS if d[0] not in _DATE_DIM_KEYS]
+    graph_curve_label = ctrl2.selectbox(
+        "Dim courbe",
+        options=curve_options,
+        index=0,
+        key=f"{key_prefix}_graph_curve",
+        help="Une courbe par valeur de cette dimension. « Aucune » = courbe agrégée.",
+    )
+
+    graph_time_dim = next(d for d in DIMENSION_DIMS if d[1] == graph_time_label)
+    if graph_curve_label != _NONE_GRAPH:
+        graph_curve_dim = next(d for d in DIMENSION_DIMS if d[1] == graph_curve_label)
+        graph_dims_list = [graph_time_dim, graph_curve_dim]
+        curve_key = graph_curve_dim[0]
+    else:
+        graph_curve_dim = None
+        graph_dims_list = [graph_time_dim]
+        curve_key = None
+
+    graph_weeks_list = periods_in_range(picked_start, picked_end, graph_time_dim[0])
+    if not graph_weeks_list:
+        st.info("Plage de dates vide pour cette granularité.")
+        return
+
+    with st.spinner("Graphe…"):
+        try:
+            raw_df = run_query(funnel_sql(brand_type, filters, graph_dims_list, graph_weeks_list))
+            graph_df = funnel_graph_data(raw_df, graph_time_dim[0], curve_key)
+        except Exception as e:
+            st.error(f"Erreur graphe : {e}")
+            return
+
+    if graph_df.empty:
+        st.info("Aucune donnée pour ce périmètre.")
+        return
+
+    # Available KPIs = those with at least one non-null point.
+    has_data = (
+        graph_df.dropna(subset=["value"])
+        .groupby("kpi")
+        .size()
+        .reset_index(name="n")
+    )
+    available = set(has_data["kpi"].tolist())
+    available_kpis_ordered = [k for k in ALL_FUNNEL_KPIS if k in available]
+    if not available_kpis_ordered:
+        st.info("Aucun KPI avec données sur cette plage.")
+        return
+
+    col_kpi, col_chart = st.columns([1.3, 4.5])
+    with col_kpi:
+        # Default to "# R0 Succeeded" if available, else first KPI
+        default_idx = 0
+        for preferred in ("# R0 Succeeded", "# R0 Attempts"):
+            if preferred in available_kpis_ordered:
+                default_idx = available_kpis_ordered.index(preferred)
+                break
+        selected_kpi = st.radio(
+            "KPI",
+            options=available_kpis_ordered,
+            index=default_idx,
+            key=f"{key_prefix}_graph_kpi",
+            label_visibility="collapsed",
+        )
+
+    with col_chart:
+        plot_data = graph_df[graph_df["kpi"] == selected_kpi].copy()
+        if plot_data.dropna(subset=["value"]).empty:
+            st.info(f"Aucune donnée pour {selected_kpi} sur cette plage.")
+            return
+
+        # If KPI is a percentage, scale to 0-100 for display
+        is_pct = selected_kpi.startswith("%")
+        if is_pct:
+            plot_data["value"] = plot_data["value"] * 100
+
+        plot_data = plot_data.sort_values("time")
+        fig = px.line(
+            plot_data,
+            x="time",
+            y="value",
+            color="curve",
+            markers=True,
+            hover_data={"time_label": True, "time": False, "value": ":.2f"},
+            labels={"time": graph_time_label, "value": selected_kpi, "curve": graph_curve_label if graph_curve_dim else "Série"},
+            title=f"{selected_kpi} — {brand_type}",
+        )
+        if is_pct:
+            fig.update_yaxes(ticksuffix=" %")
+        fig.update_layout(
+            height=440,
+            margin=dict(l=20, r=20, t=50, b=40),
+            legend=dict(orientation="v", x=1.02, y=1, xanchor="left"),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+
 def build_vamp_table(df: pd.DataFrame, dims: list) -> pd.DataFrame:
     non_week = non_week_dims(dims) if dims else []
 
@@ -2295,6 +2622,10 @@ with tab_b:
             st.markdown(render_table_html(table), unsafe_allow_html=True)
         except Exception as e:
             st.error(f"Erreur Funnel Booking : {e}")
+    # Graph section under the table — own dim/granularity selectors, reuses
+    # sidebar filters + date range.
+    st.divider()
+    render_funnel_graph("Booking", filters, _picked_start, _picked_end, key_prefix="booking")
 
 with tab_m:
     with st.spinner("Funnel Magazine…"):
