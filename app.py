@@ -1465,7 +1465,55 @@ for _rx in ["2", "3", "4"]:
     ]
 
 
-def funnel_graph_data(df: pd.DataFrame, time_dim_key: str, curve_dim_key: str | None) -> pd.DataFrame:
+# Section structure mirroring build_funnel_table — used by the graph's left
+# panel so it has the same hierarchical look as the table above.
+FUNNEL_KPI_SECTIONS = [
+    ("R0 / Trial", [
+        "# R0 Attempts",
+        "% Success Rate R0",
+        "# R0 Succeeded",
+        "% Unsub During Trial",
+        "# R1 To Be Billed",
+        "% R1 Billed",
+    ]),
+    ("R1", [
+        "# R1 First Attempt (users)",
+        "% Success R1 First Attempt",
+        "# R1 Attempts (tx dedup)",
+        "% Success R1 Attempts",
+        "# R1 Succeeded (users)",
+        "% R1 Succeeded per User",
+        "% Churn Brut R0/R1",
+        "# Refund R1",
+        "% Refund R1",
+        "% Churn Net R0/R1",
+    ]),
+]
+for _rx in ["2", "3", "4"]:
+    _prev = str(int(_rx) - 1)
+    _lbl = f"R{_rx}"
+    FUNNEL_KPI_SECTIONS.append((_lbl, [
+        f"# {_lbl} To Be Billed",
+        f"% {_lbl} Billed",
+        f"# {_lbl} First Attempt (users)",
+        f"% Success {_lbl} First Attempt",
+        f"# {_lbl} Attempts (tx dedup)",
+        f"% Success {_lbl} Attempts",
+        f"# {_lbl} Succeeded (users)",
+        f"% {_lbl} Succeeded per User",
+        f"% Churn Brut R{_prev}/{_lbl}",
+        f"# Refund {_lbl}",
+        f"% Refund {_lbl}",
+        f"% Churn Net R{_prev}/{_lbl}",
+    ]))
+
+
+def funnel_graph_data(
+    df: pd.DataFrame,
+    time_dim_key: str,
+    curve_dim_key: str | None,
+    min_denom_for_ratios: int = 20,
+) -> pd.DataFrame:
     """Aggregate raw funnel df → tidy long DataFrame for plotting.
 
     Mirrors build_funnel_table's aggregation but with the (cell = cohort)
@@ -1474,9 +1522,13 @@ def funnel_graph_data(df: pd.DataFrame, time_dim_key: str, curve_dim_key: str | 
     summed.
 
     Args:
-      df            : raw BQ output from funnel_sql(brand_type, ..., dims=[time, curve])
-      time_dim_key  : 'date_day' | 'date_week' | 'date_month'
-      curve_dim_key : DIMENSION_DIMS key for the curve, or None (single 'Total')
+      df                   : raw BQ output from funnel_sql(brand_type, ..., dims=[time, curve])
+      time_dim_key         : 'date_day' | 'date_week' | 'date_month'
+      curve_dim_key        : DIMENSION_DIMS key for the curve, or None (single 'Total')
+      min_denom_for_ratios : ratios computed on a denominator strictly smaller
+                             than this return None (point will be skipped on
+                             the graph). Default 20 to avoid noisy points on
+                             tiny cohorts. Volume KPIs are NOT affected.
 
     Returns: tidy DataFrame (time, time_label, curve, kpi, value).
     """
@@ -1542,7 +1594,12 @@ def funnel_graph_data(df: pd.DataFrame, time_dim_key: str, curve_dim_key: str | 
         acc["tbb"] = max(acc["elig_u"] - acc["cancel_u"], 0)
 
     def _ratio(num, denom):
+        # Returns None when the denominator is too small to be meaningful — the
+        # graph will then show a gap for that point. Volume KPIs (which call
+        # this with denom=None implicitly via direct assignment) are unaffected.
         if denom is None or denom == 0:
+            return None
+        if denom < min_denom_for_ratios:
             return None
         return num / denom
 
@@ -1613,14 +1670,25 @@ def funnel_graph_data(df: pd.DataFrame, time_dim_key: str, curve_dim_key: str | 
 def render_funnel_graph(brand_type: str, filters: dict, picked_start, picked_end, key_prefix: str) -> None:
     """Render the "Évolution dans le temps" graph section under a funnel tab.
 
-    Independent from sidebar dims / granularity (own selectors below). Reuses
-    sidebar filters + picked date range. Streamlit widgets get a unique key
-    prefix so we can have one graph per tab without state collision.
+    Layout mirrors the funnel TABLE structure:
+      Left  : KPI selector — sections (R0/Trial, R1, R2..R4) with one button
+              per KPI, the active KPI highlighted (primary), inactive in
+              secondary. Scrollable container if list is long.
+      Right : Plotly line chart of the active KPI, one line per curve-dim value.
+
+    Independent from sidebar dims / granularity (own selectors at the top of
+    the section). Reuses sidebar filters + picked date range. Streamlit widgets
+    get a unique `key_prefix` so we can have one graph per tab without
+    state collision.
+
+    Points with a tiny denominator (< 20) for RATIO KPIs are hidden — see the
+    `min_denom_for_ratios` argument in funnel_graph_data.
     """
     import plotly.express as px  # lazy import — only when graph is rendered
 
     st.markdown("### 📈 Évolution dans le temps")
 
+    # --- Top controls : granularité X + dim courbe ---------------------------
     ctrl1, ctrl2, _spacer = st.columns([1.5, 1.5, 4])
     time_options = ["Date (jour)", "Date (semaine)", "Date (mois)"]
     graph_time_label = ctrl1.selectbox(
@@ -1630,7 +1698,6 @@ def render_funnel_graph(brand_type: str, filters: dict, picked_start, picked_end
         key=f"{key_prefix}_graph_time",
         help="Granularité de l'axe X (indépendant de la sidebar)",
     )
-    # Curve dim options : exclude date dims (those go on X)
     _NONE_GRAPH = "— aucune (agrégé) —"
     curve_options = [_NONE_GRAPH] + [d[1] for d in DIMENSION_DIMS if d[0] not in _DATE_DIM_KEYS]
     graph_curve_label = ctrl2.selectbox(
@@ -1638,7 +1705,7 @@ def render_funnel_graph(brand_type: str, filters: dict, picked_start, picked_end
         options=curve_options,
         index=0,
         key=f"{key_prefix}_graph_curve",
-        help="Une courbe par valeur de cette dimension. « Aucune » = courbe agrégée.",
+        help="Une courbe par valeur de cette dim. « Aucune » = une seule courbe agrégée.",
     )
 
     graph_time_dim = next(d for d in DIMENSION_DIMS if d[1] == graph_time_label)
@@ -1656,6 +1723,7 @@ def render_funnel_graph(brand_type: str, filters: dict, picked_start, picked_end
         st.info("Plage de dates vide pour cette granularité.")
         return
 
+    # --- Data fetch ----------------------------------------------------------
     with st.spinner("Graphe…"):
         try:
             raw_df = run_query(funnel_sql(brand_type, filters, graph_dims_list, graph_weeks_list))
@@ -1676,57 +1744,198 @@ def render_funnel_graph(brand_type: str, filters: dict, picked_start, picked_end
         .reset_index(name="n")
     )
     available = set(has_data["kpi"].tolist())
-    available_kpis_ordered = [k for k in ALL_FUNNEL_KPIS if k in available]
-    if not available_kpis_ordered:
-        st.info("Aucun KPI avec données sur cette plage.")
+    if not available:
+        st.info("Aucun KPI avec données sur cette plage (cohortes trop petites pour des ratios fiables, "
+                "ou volumes tous nuls).")
         return
 
-    col_kpi, col_chart = st.columns([1.3, 4.5])
-    with col_kpi:
-        # Default to "# R0 Succeeded" if available, else first KPI
-        default_idx = 0
-        for preferred in ("# R0 Succeeded", "# R0 Attempts"):
-            if preferred in available_kpis_ordered:
-                default_idx = available_kpis_ordered.index(preferred)
-                break
-        selected_kpi = st.radio(
-            "KPI",
-            options=available_kpis_ordered,
-            index=default_idx,
-            key=f"{key_prefix}_graph_kpi",
-            label_visibility="collapsed",
-        )
+    # --- Selected KPI state --------------------------------------------------
+    state_key = f"{key_prefix}_graph_kpi"
+    # Initialise / repair the selection if missing or no longer available.
+    if state_key not in st.session_state or st.session_state[state_key] not in available:
+        # Default to "# R0 Succeeded" if possible, else first available.
+        if "# R0 Succeeded" in available:
+            st.session_state[state_key] = "# R0 Succeeded"
+        elif "# R0 Attempts" in available:
+            st.session_state[state_key] = "# R0 Attempts"
+        else:
+            ordered_available = [k for k in ALL_FUNNEL_KPIS if k in available]
+            st.session_state[state_key] = ordered_available[0] if ordered_available else None
 
+    # --- Scoped CSS so KPI buttons look like compact radio entries -----------
+    # Buttons get marked via a wrapper div with class `psp-kpi-buttons` so we
+    # don't leak styles to other Streamlit buttons in the app.
+    st.markdown(
+        """
+        <style>
+          .psp-kpi-buttons div[data-testid="stVerticalBlock"] {
+            gap: 2px;
+          }
+          .psp-kpi-buttons div.stButton > button {
+            text-align: left;
+            justify-content: flex-start;
+            font-size: 12px;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-weight: 400;
+            min-height: 0;
+            line-height: 1.3;
+            width: 100%;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+          }
+          .psp-kpi-buttons div.stButton > button p {
+            font-size: 12px;
+            margin: 0;
+          }
+          .psp-kpi-section-header {
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            color: white;
+            background: #0f172a;
+            padding: 6px 10px;
+            margin: 8px 0 4px 0;
+            border-radius: 4px;
+            letter-spacing: 0.04em;
+          }
+          .psp-kpi-section-header:first-child {
+            margin-top: 0;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # --- Layout : KPI buttons left, chart right ------------------------------
+    col_kpi, col_chart = st.columns([1.6, 4.4])
+    with col_kpi:
+        st.markdown('<div class="psp-kpi-buttons">', unsafe_allow_html=True)
+        with st.container(height=520, border=False):
+            for section_name, section_kpis in FUNNEL_KPI_SECTIONS:
+                visible_kpis = [k for k in section_kpis if k in available]
+                if not visible_kpis:
+                    continue
+                st.markdown(
+                    f'<div class="psp-kpi-section-header">{section_name}</div>',
+                    unsafe_allow_html=True,
+                )
+                for kpi in visible_kpis:
+                    is_active = (kpi == st.session_state[state_key])
+                    if st.button(
+                        kpi,
+                        key=f"{key_prefix}_kpi_btn_{kpi}",
+                        type="primary" if is_active else "secondary",
+                        use_container_width=True,
+                    ):
+                        st.session_state[state_key] = kpi
+                        st.rerun()  # refresh button styling immediately
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    selected_kpi = st.session_state[state_key]
+
+    # --- Chart ---------------------------------------------------------------
     with col_chart:
         plot_data = graph_df[graph_df["kpi"] == selected_kpi].copy()
         if plot_data.dropna(subset=["value"]).empty:
-            st.info(f"Aucune donnée pour {selected_kpi} sur cette plage.")
+            st.info(f"Aucune donnée pour {selected_kpi} sur cette plage "
+                    f"(possible : dénominateur < 20 sur tous les points).")
             return
 
-        # If KPI is a percentage, scale to 0-100 for display
         is_pct = selected_kpi.startswith("%")
         if is_pct:
             plot_data["value"] = plot_data["value"] * 100
 
         plot_data = plot_data.sort_values("time")
+
+        # Colour palette : Plotly's "D3" mixed with a couple of vivid extras —
+        # works well for up to ~15 curves. Beyond that the chart is busy but
+        # the user explicitly said no plafond.
+        palette = (
+            px.colors.qualitative.D3
+            + px.colors.qualitative.Set2
+            + px.colors.qualitative.Set3
+        )
+
         fig = px.line(
             plot_data,
             x="time",
             y="value",
             color="curve",
             markers=True,
+            color_discrete_sequence=palette,
             hover_data={"time_label": True, "time": False, "value": ":.2f"},
-            labels={"time": graph_time_label, "value": selected_kpi, "curve": graph_curve_label if graph_curve_dim else "Série"},
-            title=f"{selected_kpi} — {brand_type}",
+            labels={
+                "time": graph_time_label,
+                "value": selected_kpi,
+                "curve": graph_curve_label if graph_curve_dim else "Série",
+            },
         )
+
+        # Y axis : % style for ratios, thousands separator for volumes.
         if is_pct:
-            fig.update_yaxes(ticksuffix=" %")
-        fig.update_layout(
-            height=440,
-            margin=dict(l=20, r=20, t=50, b=40),
-            legend=dict(orientation="v", x=1.02, y=1, xanchor="left"),
+            fig.update_yaxes(ticksuffix=" %", tickformat=".1f")
+        else:
+            fig.update_yaxes(tickformat=",d", separatethousands=True)
+
+        # Line + marker styling
+        fig.update_traces(
+            mode="lines+markers",
+            line=dict(width=2.5),
+            marker=dict(size=7, line=dict(width=1, color="white")),
+            connectgaps=False,  # gap at None points (small-cohort threshold)
+            hovertemplate=(
+                "<b>%{fullData.name}</b><br>"
+                + ("%{customdata[0]}<br>" if "time_label" in plot_data.columns else "")
+                + f"{selected_kpi} : %{{y:,.2f}}"
+                + (" %" if is_pct else "")
+                + "<extra></extra>"
+            ),
         )
+
+        # Title block — clean, left-aligned
+        fig.update_layout(
+            title=dict(
+                text=f"<b>{selected_kpi}</b>  ·  {brand_type}",
+                x=0.0,
+                xanchor="left",
+                font=dict(size=15, color="#0f172a"),
+            ),
+            height=520,
+            margin=dict(l=10, r=10, t=60, b=40),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            hovermode="x unified",
+            xaxis=dict(
+                showgrid=True, gridcolor="#f1f5f9", gridwidth=1,
+                showline=True, linecolor="#cbd5e1", linewidth=1,
+                ticks="outside", tickcolor="#94a3b8",
+                title=dict(font=dict(size=12, color="#475569")),
+            ),
+            yaxis=dict(
+                showgrid=True, gridcolor="#f1f5f9", gridwidth=1,
+                showline=True, linecolor="#cbd5e1", linewidth=1,
+                zeroline=True, zerolinecolor="#cbd5e1",
+                ticks="outside", tickcolor="#94a3b8",
+                title=dict(font=dict(size=12, color="#475569")),
+                rangemode="tozero" if not is_pct else "normal",
+            ),
+            legend=dict(
+                orientation="v",
+                x=1.02, y=1, xanchor="left",
+                bgcolor="rgba(255,255,255,0.9)",
+                bordercolor="#e2e8f0", borderwidth=1,
+                font=dict(size=11),
+            ),
+            font=dict(family="-apple-system, BlinkMacSystemFont, sans-serif"),
+        )
+
         st.plotly_chart(fig, use_container_width=True)
+        st.caption(
+            "💡 Points masqués : sur les **ratios**, les cellules dont le dénominateur "
+            "< 20 sont laissées vides (cohorte trop petite pour être lisible)."
+        )
 
 
 def build_vamp_table(df: pd.DataFrame, dims: list) -> pd.DataFrame:
