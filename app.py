@@ -2180,7 +2180,7 @@ def exec_summary_sql() -> str:
                         Concimax, Rapidoxy}
       - psp = LOWER(ms_default_psp) (e.g. 'trustpayment', 'pixxles', 'nmi')
       - bucket ∈ {'s1' (current Month-to-Date), 's2' (previous month same window)}
-      - metric ∈ {r0, tbb_count, r1_net_count, brut, refund_rev,
+      - metric ∈ {r0, churn_cohort_size, r1_net_count, brut, refund_rev,
                   tx_succ_visa, alerts_visa}
       - value FLOAT64
 
@@ -2193,17 +2193,28 @@ def exec_summary_sql() -> str:
     KPIs derived in Python from these atoms (see render_exec_summary):
       - R0                = r0                            (customer-level count, not membership)
       - CA Net            = brut - refund_rev             (brut by t_date; refund by refunded_at_utc)
-      - % Churn R0→R1 net = 1 - (r1_net_count / tbb_count)  (Booking ONLY)
+      - % Churn R0→R1 net = 1 - (r1_net_count / churn_cohort_size)  (Booking ONLY)
       - % Refund          = refund_rev / brut             (CA-based, dates differentiated)
       - % VAMP Ratio      = alerts_visa / tx_succ_visa    (VISA only — VAMP = Visa Acquirer Monitoring Program)
 
+    IMPORTANT — Churn cohort definition (≠ TBB) :
+      The cohort used as denominator for the % Churn R0→R1 INCLUDES customers
+      who cancelled during their trial. They ARE real churners (they signed up
+      and didn't convert to a billed R1) — so excluding them would
+      under-estimate churn. The only restriction is "had time to reach R1",
+      enforced by `ms_trial_end ∈ window` (trial ended within the window).
+
+      This is DIFFERENT from the funnel table's "# R1 To Be Billed" (TBB),
+      which is an audit metric (\"who SHOULD have been billed by now?\") and
+      legitimately excludes cancelled-during-trial. Don't confuse the two.
+
     Date semantics:
-      - r0           : by ms_date (signup date)
-      - tbb_cohort   : by ms_trial_end (cohort that should have been billed in window)
-      - brut         : by t_date (transaction date) for status='succeeded' tx (all cards)
-      - refund_rev   : by refunded_at_utc (refund date), independent of t_date (all cards)
-      - tx_succ_visa : by t_date (transaction date), VISA + DELTA only
-      - alerts_visa  : by alerted_at (alert date), cardnetwork='Visa' only
+      - r0                : by ms_date (signup date)
+      - churn_cohort_size : by ms_trial_end (cohort that should have reached R1 by now)
+      - brut              : by t_date (transaction date) for status='succeeded' tx (all cards)
+      - refund_rev        : by refunded_at_utc (refund date), independent of t_date (all cards)
+      - tx_succ_visa      : by t_date (transaction date), VISA + DELTA only
+      - alerts_visa       : by alerted_at (alert date), cardnetwork='Visa' only
 
     Card scope:
       - r0 / brut / refund_rev : all card brands (R0, CA, Refund are global metrics)
@@ -2273,12 +2284,18 @@ r0 AS (
     AND ms_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
   GROUP BY 1, 2, 3
 ),
-tbb_cohort AS (
-  -- Cohort for Churn R0→R1: memberships whose TrialEnd falls in s1/s2
-  -- and that weren't cancelled during the trial (TBB = To Be Billed).
-  -- BOOKING ONLY — the churn measured here is the conversion of the
-  -- Booking sub from trial to billed. Magazine cross-sells have their
-  -- own dynamic and shouldn't pollute this number.
+churn_cohort AS (
+  -- Cohort for % Churn R0→R1 net : ALL Booking memberships whose TrialEnd
+  -- falls in s1/s2 (= had a chance to reach R1). INCLUDES customers who
+  -- cancelled during the trial — they ARE real churners.
+  --
+  -- Distinct from the funnel table's "# R1 To Be Billed" (TBB), which is
+  -- an audit metric ("who should we have billed?") and legitimately
+  -- excludes cancelled-during-trial. The two cohorts serve different
+  -- purposes — see exec_summary_sql docstring.
+  --
+  -- BOOKING ONLY — we measure conversion of the Booking sub from trial
+  -- to billed. Magazine cross-sells have their own dynamic.
   SELECT fm.conciergerie, fm.psp,
     CASE
       WHEN fm.ms_trial_end BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
@@ -2299,17 +2316,18 @@ tbb_cohort AS (
   WHERE fm.conciergerie IS NOT NULL
     AND fm.brand_type = 'Booking'
     AND fm.ms_trial_end BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
-    AND NOT fm.cancelled_during_trial
+    -- NB : NO `NOT cancelled_during_trial` filter — cancelled-during-trial
+    -- customers ARE churners and must be in the denominator.
   GROUP BY 1, 2, 3, 4
 ),
 churn_agg AS (
-  SELECT conciergerie, psp, bucket, 'tbb_count' AS metric,
+  SELECT conciergerie, psp, bucket, 'churn_cohort_size' AS metric,
     CAST(COUNT(*) AS FLOAT64) AS value
-  FROM tbb_cohort GROUP BY 1, 2, 3
+  FROM churn_cohort GROUP BY 1, 2, 3
   UNION ALL
   SELECT conciergerie, psp, bucket, 'r1_net_count' AS metric,
     CAST(SUM(has_r1_net) AS FLOAT64) AS value
-  FROM tbb_cohort GROUP BY 1, 2, 3
+  FROM churn_cohort GROUP BY 1, 2, 3
 ),
 ft_in_window AS (
   -- Transactions by t_date (transaction date) — used for brut revenue and
@@ -2530,9 +2548,11 @@ def render_exec_summary(df: pd.DataFrame) -> str:
         return f"<tr><td class='exec-kpi-label'>{label}</td>{''.join(cells)}</tr>"
 
     def churn_fn(c, p, b):
-        tbb = m(c, p, b, "tbb_count")
-        r1  = m(c, p, b, "r1_net_count")
-        return None if tbb == 0 else 1 - (r1 / tbb)
+        # Churn cohort = Booking memberships dont TrialEnd ∈ fenêtre.
+        # INCLUT les cancelled-during-trial (= vrais churners). PAS un TBB.
+        cohort = m(c, p, b, "churn_cohort_size")
+        r1     = m(c, p, b, "r1_net_count")
+        return None if cohort == 0 else 1 - (r1 / cohort)
 
     def refund_fn(c, p, b):
         # CA-based refund rate: € refunded (by refund_at_utc) / € brut (by t_date)
