@@ -1391,10 +1391,14 @@ def build_funnel_table(df: pd.DataFrame, brand_type: str, dims: list) -> pd.Data
              [val_or(g, lambda g=g: fmt_pct(gr(g, prev, "succ_u") - gr(g, rx, "succ_u"), gr(g, prev, "succ_u"))) for g in groups])
         push(f"# Refund {lbl}", [val_or(g, lambda g=g: fmt_int(gr(g, rx, "refund_tx"))) for g in groups])
         push(f"% Refund {lbl}", [val_or(g, lambda g=g: fmt_pct(gr(g, rx, "refund_tx"), gr(g, rx, "succ_tx"))) for g in groups])
+        # % Churn Net Rn/Rm = (Rn_net - Rm_net) / Rn_net
+        # où Rk_net = succ_u_k - refund_u_k. AVANT (bug) : on divisait par Rn_brut
+        # ce qui faisait un mix brut/net et surestimait le churn de ~20 pts.
         push(f"% Churn Net R{prev}/{lbl}",
              [val_or(g, lambda g=g: fmt_pct(
-                 gr(g, prev, "succ_u") - (gr(g, rx, "succ_u") - gr(g, rx, "refund_u")),
-                 gr(g, prev, "succ_u"))) for g in groups])
+                 (gr(g, prev, "succ_u") - gr(g, prev, "refund_u"))
+                   - (gr(g, rx, "succ_u") - gr(g, rx, "refund_u")),
+                 gr(g, prev, "succ_u") - gr(g, prev, "refund_u"))) for g in groups])
 
     out = pd.DataFrame(rows)
     out.attrs["dims"] = dims
@@ -1650,9 +1654,12 @@ def funnel_graph_data(
             kpis[f"% Churn Brut R{prev}/{lbl}"]    = _ratio(gr(prev, "succ_u") - gr(rx, "succ_u"), gr(prev, "succ_u"))
             kpis[f"# Refund {lbl}"]                = gr(rx, "refund_tx")
             kpis[f"% Refund {lbl}"]                = _ratio(gr(rx, "refund_tx"), gr(rx, "succ_tx"))
-            kpis[f"% Churn Net R{prev}/{lbl}"]     = _ratio(
-                gr(prev, "succ_u") - (gr(rx, "succ_u") - gr(rx, "refund_u")),
-                gr(prev, "succ_u"))
+            # % Churn Net Rn/Rm = (Rn_net - Rm_net) / Rn_net
+            # où Rk_net = succ_u_k - refund_u_k. AVANT (bug) : on divisait par
+            # Rn_brut — surestimait le churn ~20 pts.
+            _prev_net = gr(prev, "succ_u") - gr(prev, "refund_u")
+            _rx_net   = gr(rx,   "succ_u") - gr(rx,   "refund_u")
+            kpis[f"% Churn Net R{prev}/{lbl}"]     = _ratio(_prev_net - _rx_net, _prev_net)
 
         t_label = cell_labels[(t_key, c_val)]
         for kpi_name, val in kpis.items():
