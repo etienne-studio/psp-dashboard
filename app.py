@@ -256,6 +256,171 @@ MAGAZINE_PRICE_EXPR = (
     "ELSE '' END"
 )
 
+
+# ============================================================================
+# LTV SIMULATOR — constants + helpers
+# ----------------------------------------------------------------------------
+# Projection LTV pour chaque cohorte affichée dans le Funnel Booking.
+#   - R observés (R1-R4) : data réelle de la cohorte
+#   - R au-delà : projection avec decay factor hardcodé depuis cohortes Déc 2025
+#   - 2 chains indépendantes (BRUT et NET), même logique
+#
+# Decay factor = ratio churn(R_n) / churn(R_n-1) entre cycles successifs,
+# calculé sur cohortes méthodo canonique (c.CreatedAtUtc + ms_date in Déc 2025
+# + ms_status NOT IN abandonned/processing/paused + brand_type=Booking).
+#
+# Au-delà du dernier R observé en référence : decay = 0.9 constant.
+# ============================================================================
+
+# Decay €19 bi-mensuel (cohort Déc 2025 TP EUR, R1-R11 observés)
+LTV_DECAY_BIM_NET = {2: 0.7013, 3: 0.8071, 4: 0.7722, 5: 0.6991, 6: 0.8238,
+                     7: 1.1581, 8: 0.8333, 9: 1.3923, 10: 1.0020, 11: 0.7521}
+LTV_DECAY_BIM_BRUT = {2: 0.9565, 3: 0.7651, 4: 0.8067, 5: 0.6829, 6: 0.7954,
+                      7: 1.2364, 8: 0.7581, 9: 1.4641, 10: 0.9032, 11: 0.8273}
+
+# Decay €49 mensuel (cohort Déc 2025 TP EUR, R1-R5 observés)
+LTV_DECAY_MENS_NET = {2: 0.6015, 3: 0.9660, 4: 0.7541, 5: 1.0290}
+LTV_DECAY_MENS_BRUT = {2: 0.8447, 3: 1.0200, 4: 0.6655, 5: 1.1116}
+
+# Mapping bucket prix → (cycle_days, horizon, amount_eur, last_obs_ref, decay_brut, decay_net)
+LTV_PRICE_CONFIG = {
+    "19€ bi-mensuel": (14, 26, 19.99, 11, LTV_DECAY_BIM_BRUT, LTV_DECAY_BIM_NET),
+    "49€ mensuel":    (30, 12, 49.99, 5,  LTV_DECAY_MENS_BRUT, LTV_DECAY_MENS_NET),
+    "69€ mensuel":    (30, 12, 69.99, 5,  LTV_DECAY_MENS_BRUT, LTV_DECAY_MENS_NET),  # mirror €49
+}
+LTV_TRIAL_DAYS = 3
+LTV_DEFAULT_DECAY = 0.9  # appliqué au-delà du dernier R observé en référence
+
+
+def _ltv_fmt_eur(amount) -> str:
+    """Format FR : 1 234,56 €."""
+    if amount is None:
+        return "—"
+    s = f"{amount:,.2f}"
+    s = s.replace(",", " ").replace(".", ",")  # NBSP entre milliers
+    return f"{s} €"
+
+
+def _ltv_get_price_from_group(group_key: tuple, dims: list):
+    """Extract price bucket from group_key if 'price_booking' is a dim.
+    Returns the bucket string ('19€ bi-mensuel' etc.) or None."""
+    if not dims:
+        return None
+    for i, d in enumerate(dims):
+        if d[0] == "price_booking" and i < len(group_key):
+            value = group_key[i]
+            if value in LTV_PRICE_CONFIG:
+                return value
+    return None
+
+
+def _ltv_cohort_end_date(group_sort_key_tuple: tuple, dims: list,
+                          picked_end_date: date) -> date:
+    """Determine the END date of the cohort window for max_R_observable.
+    - If a date dim is in dims : use week_start + period span
+    - Else : use the sidebar's picked_end (cohort spans entire window)"""
+    if dims:
+        for i, d in enumerate(dims):
+            if d[0] in _DATE_DIM_KEYS and i < len(group_sort_key_tuple):
+                ws_str = group_sort_key_tuple[i]
+                try:
+                    ws = date.fromisoformat(str(ws_str))
+                except (ValueError, TypeError):
+                    return picked_end_date
+                if d[0] == "date_day":
+                    return ws
+                elif d[0] == "date_week":
+                    return ws + timedelta(days=6)
+                elif d[0] == "date_month":
+                    if ws.month == 12:
+                        next_month = date(ws.year + 1, 1, 1)
+                    else:
+                        next_month = date(ws.year, ws.month + 1, 1)
+                    return next_month - timedelta(days=1)
+    return picked_end_date
+
+
+def _ltv_compute(group_data: dict, price_bucket: str,
+                  cohort_end_date: date, today: date) -> dict:
+    """Compute ARPU + LTV brut/net for one cohort group.
+    Returns dict with keys arpu_eur, ltv_brut_eur, ltv_net_eur, r_max_obs,
+    or None if not computable (no R0, no observation possible)."""
+    if price_bucket not in LTV_PRICE_CONFIG:
+        return None
+    cycle_days, horizon, amount, last_obs_ref, decay_brut, decay_net = \
+        LTV_PRICE_CONFIG[price_bucket]
+
+    r0 = group_data.get("r0_succeeded", 0)
+    if r0 == 0:
+        return None
+
+    # Max R observable (worst case = latest user in cohort).
+    # Rn date = cohort_end + trial_days + (n-1) * cycle_days
+    # Rn observable iff cohort_end + trial_days + (n-1)*cycle_days <= today
+    # => n <= 1 + (today - cohort_end - trial_days) / cycle_days
+    days_since_end = (today - cohort_end_date).days
+    if days_since_end < LTV_TRIAL_DAYS:
+        return None  # trial still in flight for latest user
+    r_max_obs = 1 + (days_since_end - LTV_TRIAL_DAYS) // cycle_days
+    r_max_obs = min(r_max_obs, 4)  # funnel_sql only returns R1-R4
+    if r_max_obs < 1:
+        return None
+
+    # Observed retention (BRUT + NET) per R0
+    rx = group_data.get("rx", {})
+    obs_brut = {}
+    obs_net = {}
+    for n in range(1, r_max_obs + 1):
+        d = rx.get(str(n), {})
+        succ_u = d.get("succ_u", 0)
+        refund_u = d.get("refund_u", 0)
+        obs_brut[n] = succ_u / r0
+        obs_net[n] = max(succ_u - refund_u, 0) / r0
+
+    # ARPU = realized revenue NET per R0 (over observed R only)
+    arpu_eur = sum(obs_net.values()) * amount
+
+    # Project R_max_obs+1 .. horizon using decay factors
+    # Starting churns = last observed cycle churn
+    proj_brut = dict(obs_brut)
+    proj_net = dict(obs_net)
+    last_n = r_max_obs
+    if last_n == 1:
+        prev_churn_brut = 1 - obs_brut[1]
+        prev_churn_net = 1 - obs_net[1]
+    else:
+        # Use ratios for last cycle churn
+        prev_b = obs_brut[last_n - 1]
+        prev_n = obs_net[last_n - 1]
+        prev_churn_brut = 1 - (obs_brut[last_n] / prev_b) if prev_b > 0 else 0
+        prev_churn_net = 1 - (obs_net[last_n] / prev_n) if prev_n > 0 else 0
+    cur_brut = obs_brut[last_n]
+    cur_net = obs_net[last_n]
+    for n in range(last_n + 1, horizon + 1):
+        d_b = decay_brut.get(n, LTV_DEFAULT_DECAY) if n <= last_obs_ref \
+              else LTV_DEFAULT_DECAY
+        d_n = decay_net.get(n, LTV_DEFAULT_DECAY) if n <= last_obs_ref \
+              else LTV_DEFAULT_DECAY
+        this_churn_brut = max(min(prev_churn_brut * d_b, 1.0), 0.0)
+        this_churn_net = max(min(prev_churn_net * d_n, 1.0), 0.0)
+        cur_brut = cur_brut * (1 - this_churn_brut)
+        cur_net = cur_net * (1 - this_churn_net)
+        proj_brut[n] = cur_brut
+        proj_net[n] = cur_net
+        prev_churn_brut = this_churn_brut
+        prev_churn_net = this_churn_net
+
+    ltv_brut_eur = sum(proj_brut.values()) * amount
+    ltv_net_eur = sum(proj_net.values()) * amount
+
+    return {
+        "arpu_eur": arpu_eur,
+        "ltv_brut_eur": ltv_brut_eur,
+        "ltv_net_eur": ltv_net_eur,
+        "r_max_obs": r_max_obs,
+    }
+
+
 # Brand naming convention :
 #   <Conciergerie>                              → Booking sub, default MID
 #   <conciergerie> - magazine                   → Magazine cross-sell, default MID
@@ -1306,8 +1471,14 @@ def _safe_str(v) -> str:
     return s if s != "" else "(empty)"
 
 
-def build_funnel_table(df: pd.DataFrame, brand_type: str, dims: list) -> pd.DataFrame:
-    """Pivot the long-format funnel df into a (KPI × dim_combo) display table."""
+def build_funnel_table(df: pd.DataFrame, brand_type: str, dims: list,
+                        picked_end: date = None, today: date = None) -> pd.DataFrame:
+    """Pivot the long-format funnel df into a (KPI × dim_combo) display table.
+
+    Args:
+        picked_end : end date of selected sidebar range (used by LTV simulator).
+        today      : observation date (defaults to date.today() — used by LTV).
+    """
     # Determine grouping
     has_week = any(d[0] in _DATE_DIM_KEYS for d in dims) if dims else False
     non_week = non_week_dims(dims) if dims else []
@@ -1447,6 +1618,41 @@ def build_funnel_table(df: pd.DataFrame, brand_type: str, dims: list) -> pd.Data
                  (gr(g, prev, "succ_u") - gr(g, prev, "refund_u"))
                    - (gr(g, rx, "succ_u") - gr(g, rx, "refund_u")),
                  gr(g, prev, "succ_u") - gr(g, prev, "refund_u"))) for g in groups])
+
+    # =====================================================================
+    # LTV Simulator (Booking only) — adds 4 lines at the bottom
+    # =====================================================================
+    if brand_type == "Booking":
+        _today = today or date.today()
+        _picked_end = picked_end or _today
+
+        arpu_vals = []
+        ltv_brut_vals = []
+        ltv_net_vals = []
+        for g in groups:
+            price = _ltv_get_price_from_group(g, dims)
+            if price is None:
+                arpu_vals.append("—")
+                ltv_brut_vals.append("—")
+                ltv_net_vals.append("—")
+                continue
+            sort_key = group_sort_key.get(g, g)
+            cohort_end = _ltv_cohort_end_date(sort_key, dims, _picked_end)
+            sim = _ltv_compute(by_group[g], price, cohort_end, _today)
+            if sim is None:
+                arpu_vals.append("—")
+                ltv_brut_vals.append("—")
+                ltv_net_vals.append("—")
+            else:
+                arpu_vals.append(_ltv_fmt_eur(sim["arpu_eur"]))
+                ltv_brut_vals.append(_ltv_fmt_eur(sim["ltv_brut_eur"]))
+                ltv_net_vals.append(_ltv_fmt_eur(sim["ltv_net_eur"]))
+
+        push("LTV Simulator", ["" for _ in groups], section=True)
+        push("# R0 Succeeded", [fmt_int(g0(g, "r0_succeeded")) for g in groups])
+        push("ARPU R0→R∞ (€)", arpu_vals)
+        push("LTV brute (€)", ltv_brut_vals)
+        push("LTV net (€)", ltv_net_vals)
 
     out = pd.DataFrame(rows)
     out.attrs["dims"] = dims
@@ -2074,6 +2280,10 @@ _IMPORTANT_TOKENS = (
     "% VAMP (Rx Booking)",
     "% VAMP (Rx Magazine)",
     "# Tx Succeeded (Total)",
+    # LTV Simulator
+    "ARPU R0→R∞ (€)",
+    "LTV brute (€)",
+    "LTV net (€)",
 )
 
 
@@ -2903,7 +3113,7 @@ with tab_b:
     with st.spinner("Funnel Booking…"):
         try:
             df = run_query(funnel_sql("Booking", filters, dims, weeks_list))
-            table = build_funnel_table(df, "Booking", dims)
+            table = build_funnel_table(df, "Booking", dims, picked_end=_picked_end)
             st.markdown(render_table_html(table), unsafe_allow_html=True)
         except Exception as e:
             st.error(f"Erreur Funnel Booking : {e}")
