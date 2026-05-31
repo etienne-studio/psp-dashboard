@@ -192,6 +192,7 @@ FILTER_DIMS = [
     # (alias substituted with fm/ft); otherwise it's a plain column name.
     # Expressions are rewired just below DIMENSION_DIMS (after they are defined).
     ("conciergerie",    "Conciergerie",    "PLACEHOLDER",        "PLACEHOLDER"),
+    ("mid",             "MID",             "PLACEHOLDER",        "PLACEHOLDER"),
     ("verticale",       "Verticale",       "sgw_verticale",      "sgw_verticale"),
     ("psp",             "PSP",             "ms_default_psp",     "ms_default_psp"),
     ("currency",        "Devise",          "ms_currency",        "ms_currency"),
@@ -255,13 +256,31 @@ MAGAZINE_PRICE_EXPR = (
     "ELSE '' END"
 )
 
-# Conciergerie expression — maps brand to the canonical business name.
-# Same brand for both Booking and Magazine (e.g. "Reserv-Go" and
-# "Reserv-go - magazine" → "Reserv-Go").
-# Two variants: one using fm.brand, one using ft.t_brand.
+# Brand naming convention :
+#   <Conciergerie>                              → Booking sub, default MID
+#   <conciergerie> - magazine                   → Magazine cross-sell, default MID
+#   <Conciergerie> - <MID>                      → Booking sub, specific MID
+#   <conciergerie> - magazine - <MID>           → Magazine cross-sell, specific MID
+#
+# Examples observed in fact_memberships :
+#   "Reserv-Go"                       → Reserv-Go × default
+#   "Reserv-go - magazine"            → Reserv-Go × default × magazine variant
+#   "Rezaflash"                       → Rezaflash × default MID (= EMS)
+#   "Rezaflash - Kadima"              → Rezaflash × Kadima MID
+#   "Rezaflash - magazine - Kadima"   → Rezaflash × Kadima × magazine variant
+#   "Rapidoxy - LaBanquePostale"      → Rapidoxy × LaBanquePostale MID
+#
+# Two derived dims :
+#   - CONCIERGERIE = first segment before ' - ' (collapses magazine + MID).
+#   - MID          = brand with ' - magazine' stripped anywhere (keeps the
+#                    MID suffix). Special-cased for Rezaflash default → EMS
+#                    per business convention (default Rezaflash = EMS MID).
 def _conciergerie_expr(brand_col: str) -> str:
+    """Canonical conciergerie name = first segment of `brand` before ` - `.
+    Anything unknown → NULL (will be excluded from filters/dims via
+    `COALESCE(... , '')` upstream)."""
     return (
-        f"CASE LOWER(REGEXP_REPLACE(COALESCE({{alias}}.{brand_col}, ''), r' - magazine$', '')) "
+        f"CASE LOWER(SPLIT(COALESCE({{alias}}.{brand_col}, ''), ' - ')[OFFSET(0)]) "
         "  WHEN 'reserv-go'    THEN 'Reserv-Go' "
         "  WHEN 'book-ici'     THEN 'Book-Ici' "
         "  WHEN 'rezaflash'    THEN 'Rezaflash' "
@@ -269,13 +288,39 @@ def _conciergerie_expr(brand_col: str) -> str:
         "  WHEN 'jumpaide.com' THEN 'Jumpaide' "
         "  WHEN 'concimax'     THEN 'Concimax' "
         "  WHEN 'rapidoxy'     THEN 'Rapidoxy' "
-        "  WHEN 'concicast'    THEN 'Concicast' "
-        f"  ELSE COALESCE({{alias}}.{brand_col}, '') "
+        "  ELSE NULL "  # exclut Concicast (legacy, plus de volume) + helpprio
         "END"
     )
 
+
+def _mid_expr(brand_col: str) -> str:
+    """MID = conciergerie canonical + suffix MID (if any).
+
+    Strip ' - magazine' anywhere in the string (handles all 4 brand shapes),
+    then map known prefixes to canonical conciergerie name + keep the MID
+    suffix. Rezaflash default brand (no suffix) → 'Rezaflash EMS' per
+    business convention (default MID at Novalane = EMS)."""
+    cleaned = f"REGEXP_REPLACE(COALESCE({{alias}}.{brand_col}, ''), r' - magazine', '')"
+    return (
+        f"CASE LOWER({cleaned}) "
+        "  WHEN 'reserv-go'                  THEN 'Reserv-Go' "
+        "  WHEN 'book-ici'                   THEN 'Book-Ici' "
+        "  WHEN 'resadexa'                   THEN 'Resadexa' "
+        "  WHEN 'rezaflash'                  THEN 'Rezaflash EMS' "
+        "  WHEN 'rezaflash - kadima'         THEN 'Rezaflash Kadima' "
+        "  WHEN 'jumpaide.com'               THEN 'Jumpaide' "
+        "  WHEN 'concimax'                   THEN 'Concimax' "
+        "  WHEN 'rapidoxy'                   THEN 'Rapidoxy' "
+        "  WHEN 'rapidoxy - labanquepostale' THEN 'Rapidoxy LaBanquePostale' "
+        "  ELSE NULL "
+        "END"
+    )
+
+
 CONCIERGERIE_EXPR_FM = _conciergerie_expr("brand")
 CONCIERGERIE_EXPR_FT = _conciergerie_expr("t_brand")
+MID_EXPR_FM = _mid_expr("brand")
+MID_EXPR_FT = _mid_expr("t_brand")
 
 DIMENSION_DIMS = [
     # (key, label, fm column-or-expression, ft column-or-expression)
@@ -290,6 +335,7 @@ DIMENSION_DIMS = [
     ("date_day",       "Date (jour)",             None,                          None),
     ("date_month",     "Date (mois)",             None,                          None),
     ("conciergerie",   "Conciergerie",            CONCIERGERIE_EXPR_FM,          CONCIERGERIE_EXPR_FT),
+    ("mid",            "MID",                     MID_EXPR_FM,                   MID_EXPR_FT),
     ("verticale",      "Verticale",               "sgw_verticale",               "sgw_verticale"),
     # Customer-level price buckets (cp_price CTE).
     # Same semantics as the "Prix Booking" / "Prix Magazine" FILTERS: each
@@ -331,6 +377,8 @@ def _wire_filter(k, fm, ft):
         return (MAGAZINE_PRICE_EXPR, MAGAZINE_PRICE_EXPR)
     if k == "conciergerie":
         return (CONCIERGERIE_EXPR_FM, CONCIERGERIE_EXPR_FT)
+    if k == "mid":
+        return (MID_EXPR_FM, MID_EXPR_FT)
     return (fm, ft)
 
 FILTER_DIMS = [
@@ -2227,11 +2275,12 @@ def exec_summary_sql() -> str:
       - r0 / brut / refund_rev : all card brands (R0, CA, Refund are global metrics)
       - tx_succ_visa / alerts_visa : Visa only (DELTA = Visa Debit UK, same network)
     """
-    # Conciergerie canonical mapping — same logic as CONCIERGERIE_EXPR_FM/FT
-    # but inlined with the conciergerie names this tab cares about.
+    # Conciergerie canonical mapping — same logic as the global
+    # CONCIERGERIE_EXPR_FM/FT: take SPLIT(brand, ' - ')[0] to collapse
+    # both magazine variants and MID suffixes into one canonical name.
     def _conc(alias: str, col: str) -> str:
         return (
-            f"CASE LOWER(REGEXP_REPLACE(COALESCE({alias}.{col}, ''), r' - magazine$', '')) "
+            f"CASE LOWER(SPLIT(COALESCE({alias}.{col}, ''), ' - ')[OFFSET(0)]) "
             "  WHEN 'reserv-go'    THEN 'Reserv-Go' "
             "  WHEN 'book-ici'     THEN 'Book-Ici' "
             "  WHEN 'resadexa'     THEN 'Resadexa' "
