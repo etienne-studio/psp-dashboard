@@ -377,8 +377,9 @@ def _ltv_compute(group_data: dict, price_bucket: str,
         obs_brut[n] = succ_u / r0
         obs_net[n] = max(succ_u - refund_u, 0) / r0
 
-    # ARPU = realized revenue NET per R0 (over observed R only)
-    arpu_eur = sum(obs_net.values()) * amount
+    # ARPU = realized revenue per R0 (over observed R only)
+    arpu_brut_eur = sum(obs_brut.values()) * amount
+    arpu_net_eur = sum(obs_net.values()) * amount
 
     # Project R_max_obs+1 .. horizon using decay factors
     # Starting churns = last observed cycle churn
@@ -414,7 +415,8 @@ def _ltv_compute(group_data: dict, price_bucket: str,
     ltv_net_eur = sum(proj_net.values()) * amount
 
     return {
-        "arpu_eur": arpu_eur,
+        "arpu_brut_eur": arpu_brut_eur,
+        "arpu_net_eur": arpu_net_eur,
         "ltv_brut_eur": ltv_brut_eur,
         "ltv_net_eur": ltv_net_eur,
         "r_max_obs": r_max_obs,
@@ -1626,31 +1628,30 @@ def build_funnel_table(df: pd.DataFrame, brand_type: str, dims: list,
         _today = today or date.today()
         _picked_end = picked_end or _today
 
-        arpu_vals = []
-        ltv_brut_vals = []
-        ltv_net_vals = []
+        arpu_brut_vals, arpu_net_vals = [], []
+        ltv_brut_vals, ltv_net_vals = [], []
         for g in groups:
             price = _ltv_get_price_from_group(g, dims)
             if price is None:
-                arpu_vals.append("—")
-                ltv_brut_vals.append("—")
-                ltv_net_vals.append("—")
+                for lst in (arpu_brut_vals, arpu_net_vals, ltv_brut_vals, ltv_net_vals):
+                    lst.append("—")
                 continue
             sort_key = group_sort_key.get(g, g)
             cohort_end = _ltv_cohort_end_date(sort_key, dims, _picked_end)
             sim = _ltv_compute(by_group[g], price, cohort_end, _today)
             if sim is None:
-                arpu_vals.append("—")
-                ltv_brut_vals.append("—")
-                ltv_net_vals.append("—")
+                for lst in (arpu_brut_vals, arpu_net_vals, ltv_brut_vals, ltv_net_vals):
+                    lst.append("—")
             else:
-                arpu_vals.append(_ltv_fmt_eur(sim["arpu_eur"]))
+                arpu_brut_vals.append(_ltv_fmt_eur(sim["arpu_brut_eur"]))
+                arpu_net_vals.append(_ltv_fmt_eur(sim["arpu_net_eur"]))
                 ltv_brut_vals.append(_ltv_fmt_eur(sim["ltv_brut_eur"]))
                 ltv_net_vals.append(_ltv_fmt_eur(sim["ltv_net_eur"]))
 
         push("LTV Simulator", ["" for _ in groups], section=True)
         push("# R0 Succeeded", [fmt_int(g0(g, "r0_succeeded")) for g in groups])
-        push("ARPU R0→R∞ (€)", arpu_vals)
+        push("ARPU brute (€)", arpu_brut_vals)
+        push("ARPU net (€)", arpu_net_vals)
         push("LTV brute (€)", ltv_brut_vals)
         push("LTV net (€)", ltv_net_vals)
 
@@ -1722,6 +1723,14 @@ for _rx in ["2", "3", "4"]:
         f"% Churn Net R{_prev}/{_lbl}",
     ]
 
+# LTV Simulator KPIs (Booking only, calculated from observed R + decay projection)
+ALL_FUNNEL_KPIS += [
+    "ARPU brute (€)",
+    "ARPU net (€)",
+    "LTV brute (€)",
+    "LTV net (€)",
+]
+
 
 # Section structure mirroring build_funnel_table — used by the graph's left
 # panel so it has the same hierarchical look as the table above.
@@ -1765,12 +1774,22 @@ for _rx in ["2", "3", "4"]:
         f"% Churn Net R{_prev}/{_lbl}",
     ]))
 
+FUNNEL_KPI_SECTIONS.append(("LTV Simulator", [
+    "ARPU brute (€)",
+    "ARPU net (€)",
+    "LTV brute (€)",
+    "LTV net (€)",
+]))
+
 
 def funnel_graph_data(
     df: pd.DataFrame,
     time_dim_key: str,
     curve_dim_key: str | None,
     min_denom_for_ratios: int = 20,
+    picked_end: date = None,
+    today: date = None,
+    brand_type: str = "Booking",
 ) -> pd.DataFrame:
     """Aggregate raw funnel df → tidy long DataFrame for plotting.
 
@@ -1915,6 +1934,35 @@ def funnel_graph_data(
             _rx_net   = gr(rx,   "succ_u") - gr(rx,   "refund_u")
             kpis[f"% Churn Net R{prev}/{lbl}"]     = _ratio(_prev_net - _rx_net, _prev_net)
 
+        # LTV Simulator — Booking only, requires curve_dim = price_booking
+        # so the cell's c_val IS the price bucket.
+        if brand_type == "Booking" and curve_dim_key == "price_booking" \
+                and c_val in LTV_PRICE_CONFIG:
+            _today_g = today or date.today()
+            _picked_end_g = picked_end or _today_g
+            # Cohort end = t_key + period span
+            if time_dim_key == "date_day":
+                _ce = t_key
+            elif time_dim_key == "date_week":
+                _ce = t_key + timedelta(days=6) if t_key else _picked_end_g
+            elif time_dim_key == "date_month":
+                if t_key:
+                    if t_key.month == 12:
+                        _ce = date(t_key.year + 1, 1, 1) - timedelta(days=1)
+                    else:
+                        _ce = date(t_key.year, t_key.month + 1, 1) - timedelta(days=1)
+                else:
+                    _ce = _picked_end_g
+            else:
+                _ce = _picked_end_g
+            _gdat = {"r0_succeeded": g0("r0_succeeded"), "rx": agg.get("rx", {})}
+            _sim = _ltv_compute(_gdat, c_val, _ce, _today_g)
+            if _sim is not None:
+                kpis["ARPU brute (€)"] = _sim["arpu_brut_eur"]
+                kpis["ARPU net (€)"]   = _sim["arpu_net_eur"]
+                kpis["LTV brute (€)"]  = _sim["ltv_brut_eur"]
+                kpis["LTV net (€)"]    = _sim["ltv_net_eur"]
+
         t_label = cell_labels[(t_key, c_val)]
         for kpi_name, val in kpis.items():
             rows.append({
@@ -1988,7 +2036,10 @@ def render_funnel_graph(brand_type: str, filters: dict, picked_start, picked_end
     with st.spinner("Graphe…"):
         try:
             raw_df = run_query(funnel_sql(brand_type, filters, graph_dims_list, graph_weeks_list))
-            graph_df = funnel_graph_data(raw_df, graph_time_dim[0], curve_key)
+            graph_df = funnel_graph_data(
+                raw_df, graph_time_dim[0], curve_key,
+                picked_end=picked_end, brand_type=brand_type,
+            )
         except Exception as e:
             st.error(f"Erreur graphe : {e}")
             return
@@ -2281,7 +2332,8 @@ _IMPORTANT_TOKENS = (
     "% VAMP (Rx Magazine)",
     "# Tx Succeeded (Total)",
     # LTV Simulator
-    "ARPU R0→R∞ (€)",
+    "ARPU brute (€)",
+    "ARPU net (€)",
     "LTV brute (€)",
     "LTV net (€)",
 )
