@@ -362,7 +362,8 @@ def _ltv_compute(group_data: dict, price_bucket: str,
     if days_since_end < LTV_TRIAL_DAYS:
         return None  # trial still in flight for latest user
     r_max_obs = 1 + (days_since_end - LTV_TRIAL_DAYS) // cycle_days
-    r_max_obs = min(r_max_obs, 4)  # funnel_sql only returns R1-R4
+    # funnel_sql now returns R1-R26, cap at horizon
+    r_max_obs = min(r_max_obs, horizon)
     if r_max_obs < 1:
         return None
 
@@ -1158,7 +1159,9 @@ rx_stats AS (
     COUNT(DISTINCT CASE WHEN transaction_status='succeeded' THEN customer_email END) AS succ_users,
     COUNT(DISTINCT CASE WHEN is_refunded=TRUE AND transaction_status='succeeded' THEN transaction_id END) AS refund_tx,
     COUNT(DISTINCT CASE WHEN is_refunded=TRUE AND transaction_status='succeeded' THEN customer_email END) AS refund_users
-  FROM btx WHERE invoice_r_index IN ('1','2','3','4') GROUP BY ALL
+  FROM btx
+  WHERE SAFE_CAST(invoice_r_index AS INT64) BETWEEN 1 AND 26
+  GROUP BY ALL
 )
 SELECT
   FORMAT_DATE('%Y-%m-%d', w.week_start) AS week_start,
@@ -1180,7 +1183,11 @@ SELECT
   COALESCE(tbb.elig_users, 0) AS tbb_elig_users,
   COALESCE(tbb.cancel_users, 0) AS tbb_cancel_users
 FROM weeks w
-{dim_axis_join}CROSS JOIN UNNEST(['1','2','3','4']) AS rx_idx
+{dim_axis_join}CROSS JOIN UNNEST([
+  '1','2','3','4','5','6','7','8','9','10',
+  '11','12','13','14','15','16','17','18','19','20',
+  '21','22','23','24','25','26'
+]) AS rx_idx
 LEFT JOIN r0_stats r0 ON r0.cohort_week = w.week_start{dim_on_r0}
 LEFT JOIN r1_tbb_cte r1 ON r1.cohort_week = w.week_start{dim_on_r1}
 LEFT JOIN rx_stats s ON s.cohort_week = w.week_start AND s.invoice_r_index = rx_idx{dim_on_s}
