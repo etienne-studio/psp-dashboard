@@ -2496,23 +2496,30 @@ EXEC_COMPANIES = [
 ]
 
 
-def exec_summary_sql() -> str:
+def exec_summary_sql(period_start: date, period_end: date) -> str:
     """Build SQL for the Executive Summary tab.
+
+    Args:
+      period_start : 1st day of the period to analyse (s1_start).
+      period_end   : last day of the period (s1_end). For MTD = yesterday.
+                     For a full past month = last day of that month.
 
     Returns rows of (conciergerie, psp, bucket, metric, value):
       - conciergerie ∈ {Reserv-Go, Book-Ici, Resadexa, Rezaflash, Jumpaide,
                         Concimax, Rapidoxy}
       - psp = LOWER(ms_default_psp) (e.g. 'trustpayment', 'pixxles', 'nmi')
-      - bucket ∈ {'s1' (current Month-to-Date), 's2' (previous month same window)}
+      - bucket ∈ {'s1' (selected period), 's2' (previous month same window)}
       - metric ∈ {r0, churn_cohort_size, r1_net_count, brut, refund_rev,
                   tx_succ_visa, alerts_visa}
       - value FLOAT64
 
-    Window is fixed (CURRENT_DATE() server-side). Ignores sidebar
-    date/dimensions/filters by design.
+    Window is parameterised by the caller (typically driven by a month
+    selector in the Exec Summary tab). Ignores sidebar dims/filters by design.
 
-      - s1 = MTD courant : 1st of current month → yesterday
-      - s2 = MTD M-1     : 1st of previous month → same day-of-month as s1_end
+      - s1 = selected period (e.g. MTD courant OR mois complet passé)
+      - s2 = same window one month earlier (DATE_SUB INTERVAL 1 MONTH on
+             period_start and period_end — BQ clips to last valid day of
+             the prev month if needed)
 
     KPIs derived in Python from these atoms (see render_exec_summary):
       - R0                = r0                            (customer-level count, not membership)
@@ -2564,17 +2571,21 @@ def exec_summary_sql() -> str:
     ft_conc = _conc("ft", "t_brand")
     t_conc  = _conc("t",  "t_brand")
 
+    # Les bornes s2 sont calculées côté Python par _exec_period_bounds()
+    # pour gérer correctement le cas "mois complet" vs "MTD partiel".
+    s1_start, s1_end, s2_start, s2_end = _exec_period_bounds(period_start, period_end)
+    s1s, s1e, s2s, s2e = (d.isoformat() for d in (s1_start, s1_end, s2_start, s2_end))
+
     return f"""
 WITH weeks_def AS (
-  -- s1 = current Month-to-Date (1st of current month → yesterday)
-  -- s2 = same window one month earlier (1st of prev month → same day-of-month
-  --      as yesterday). BQ DATE_SUB(... INTERVAL 1 MONTH) clips to last valid
-  --      day when the target month is shorter (e.g. Mar 31 - 1m → Feb 28/29).
+  -- s1 = période sélectionnée (MTD courant ou mois passé complet)
+  -- s2 = comparaison M-1 (calculée Python : mois complet précédent si s1
+  --      est un mois complet, sinon décalage day-of-month range).
   SELECT
-    DATE_TRUNC(CURRENT_DATE(), MONTH)                                            AS s1_start,
-    DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)                                     AS s1_end,
-    DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 1 MONTH)                AS s2_start,
-    DATE_SUB(DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY), INTERVAL 1 MONTH)         AS s2_end
+    DATE '{s1s}' AS s1_start,
+    DATE '{s1e}' AS s1_end,
+    DATE '{s2s}' AS s2_start,
+    DATE '{s2e}' AS s2_end
 ),
 fm_in_window AS (
   SELECT
@@ -2757,35 +2768,115 @@ UNION ALL SELECT * FROM alerts_metrics
 """
 
 
-def _exec_period_bounds() -> tuple:
-    """Compute (s1_start, s1_end, s2_start, s2_end) MTD windows for labelling.
+_FR_MONTHS = {
+    1: "Janvier", 2: "Février", 3: "Mars", 4: "Avril",
+    5: "Mai", 6: "Juin", 7: "Juillet", 8: "Août",
+    9: "Septembre", 10: "Octobre", 11: "Novembre", 12: "Décembre",
+}
 
-      - s1 = MTD courant : 1st of current month → yesterday
-      - s2 = MTD M-1     : 1st of previous month → same day-of-month as s1_end
-                          (clipped to last day of prev month if needed)
 
-    BQ uses the same logic via CURRENT_DATE() / DATE_SUB(... 1 MONTH) — both
-    should match unless crossing a midnight boundary between server-call and
-    label rendering."""
+def _fr_month_year(d: date) -> str:
+    """FR label for a month: 'Mai 2026'."""
+    return f"{_FR_MONTHS[d.month]} {d.year}"
+
+
+def _months_for_exec_selector(n: int = 12) -> list:
+    """Return list of (label, period_start, period_end) for the Exec Summary
+    month selector.
+
+      - Index 0 = mois courant en MTD (1er → hier).
+      - Index 1+ = mois précédents complets (1er → dernier jour).
+
+    Returns up to n entries (default 12). Latest first."""
     today = date.today()
-    s1_start = today.replace(day=1)
-    s1_end = today - timedelta(days=1)
-    # 1st of previous month
-    if s1_start.month == 1:
-        s2_start = date(s1_start.year - 1, 12, 1)
+    cur_first = today.replace(day=1)
+    out = []
+    for i in range(n):
+        if i == 0:
+            p_start = cur_first
+            p_end = today - timedelta(days=1)
+            if p_end < p_start:
+                # On est le 1er du mois → MTD = juste aujourd'hui ; on skip
+                # cette entrée et on commencera par le mois passé complet.
+                continue
+            label = (
+                f"{_fr_month_year(p_start)} — MTD "
+                f"({p_start.strftime('%d/%m')} → {p_end.strftime('%d/%m')})"
+            )
+        else:
+            # i mois en arrière depuis le 1er du mois courant
+            year = cur_first.year
+            month = cur_first.month - i
+            while month <= 0:
+                month += 12
+                year -= 1
+            p_start = date(year, month, 1)
+            if month == 12:
+                next_first = date(year + 1, 1, 1)
+            else:
+                next_first = date(year, month + 1, 1)
+            p_end = next_first - timedelta(days=1)
+            label = f"{_fr_month_year(p_start)} (mois complet)"
+        out.append((label, p_start, p_end))
+    return out
+
+
+def _sub_month_clip(d: date) -> date:
+    """Soustrait 1 mois à `d`, en clippant au dernier jour valide du mois cible.
+    Ex: 31 mars → 28/29 février ; 30 mars → 28/29 février ; 15 mars → 15 février.
+    """
+    year = d.year
+    month = d.month - 1
+    if month == 0:
+        month = 12
+        year -= 1
+    if month == 12:
+        next_first = date(year + 1, 1, 1)
     else:
-        s2_start = date(s1_start.year, s1_start.month - 1, 1)
-    # Same day-of-month as s1_end in prev month (clipped if shorter)
-    try:
-        s2_end = s2_start.replace(day=s1_end.day)
-    except ValueError:
-        # Prev month has fewer days — fall back to last day of prev month.
-        # (Last day = 1st of current month - 1 day.)
-        s2_end = s1_start - timedelta(days=1)
-    return s1_start, s1_end, s2_start, s2_end
+        next_first = date(year, month + 1, 1)
+    last_day_of_target = (next_first - timedelta(days=1)).day
+    return date(year, month, min(d.day, last_day_of_target))
 
 
-def render_exec_summary(df: pd.DataFrame) -> str:
+def _last_day_of_month(d: date) -> date:
+    """Dernier jour du mois de `d`."""
+    if d.month == 12:
+        next_first = date(d.year + 1, 1, 1)
+    else:
+        next_first = date(d.year, d.month + 1, 1)
+    return next_first - timedelta(days=1)
+
+
+def _exec_period_bounds(period_start: date, period_end: date) -> tuple:
+    """Retourne (s1_start, s1_end, s2_start, s2_end) pour la fenêtre choisie.
+
+      - s1 = période sélectionnée (passée en arg)
+      - s2 = comparaison M-1 :
+            * Si s1 est un mois complet (1er → dernier jour) :
+                s2 = mois précédent complet (1er → dernier jour de M-1)
+                Ex: Avril 1-30 → Mars 1-31 (pas Mars 1-30)
+            * Sinon (MTD ou autre fenêtre partielle) :
+                s2 = même day-of-month range décalé d'1 mois (DATE_SUB INTERVAL 1 MONTH)
+                Ex: 1-25 mai → 1-25 avril
+    """
+    s1_last_day_of_month = _last_day_of_month(period_start)
+    is_full_month = (period_start.day == 1 and period_end == s1_last_day_of_month)
+
+    if is_full_month:
+        # M-1 = mois complet précédent
+        if period_start.month == 1:
+            s2_start = date(period_start.year - 1, 12, 1)
+        else:
+            s2_start = date(period_start.year, period_start.month - 1, 1)
+        s2_end = _last_day_of_month(s2_start)
+    else:
+        # MTD ou fenêtre partielle : même day-of-month range décalé d'1 mois
+        s2_start = _sub_month_clip(period_start)
+        s2_end = _sub_month_clip(period_end)
+    return period_start, period_end, s2_start, s2_end
+
+
+def render_exec_summary(df: pd.DataFrame, period_start: date, period_end: date) -> str:
     """Render the Executive Summary as inline HTML (cards + KPI table)."""
     if df.empty:
         return "<div style='color:#64748b;padding:12px;'>Aucune donnée</div>"
@@ -2908,12 +2999,18 @@ def render_exec_summary(df: pd.DataFrame) -> str:
         "</table>"
     )
 
-    # Period label (client-side, same logic as BQ — matches unless tomorrow rolled over)
-    s1_start, s1_end, s2_start, s2_end = _exec_period_bounds()
-    period_label = (
-        f"<b>MTD courant :</b> {s1_start.strftime('%d/%m')} → {s1_end.strftime('%d/%m')} "
-        f"&middot; <b>MTD M-1 :</b> {s2_start.strftime('%d/%m')} → {s2_end.strftime('%d/%m')}"
-    )
+    # Labels période — utilise les bornes calculées côté Python (match BQ).
+    s1_start, s1_end, s2_start, s2_end = _exec_period_bounds(period_start, period_end)
+    today = date.today()
+    is_mtd = (s1_end >= today - timedelta(days=1) and s1_start.day == 1
+              and s1_start.month == today.month and s1_start.year == today.year)
+    if is_mtd:
+        s1_label = f"<b>MTD {_fr_month_year(s1_start)} :</b> {s1_start.strftime('%d/%m')} → {s1_end.strftime('%d/%m')}"
+        s2_label = f"<b>MTD M-1 :</b> {s2_start.strftime('%d/%m')} → {s2_end.strftime('%d/%m')}"
+    else:
+        s1_label = f"<b>{_fr_month_year(s1_start)} (complet) :</b> {s1_start.strftime('%d/%m')} → {s1_end.strftime('%d/%m')}"
+        s2_label = f"<b>{_fr_month_year(s2_start)} (M-1) :</b> {s2_start.strftime('%d/%m')} → {s2_end.strftime('%d/%m')}"
+    period_label = f"{s1_label} &middot; {s2_label}"
 
     css = """
     <style>
@@ -3159,12 +3256,28 @@ tab_exec, tab_b, tab_m, tab_vc, tab_vd = st.tabs(
 )
 
 with tab_exec:
-    # Independent from sidebar — always shows last completed week (S-1)
-    # vs the week before (S-2). Filters/dimensions/date range NOT applied.
+    # Indépendant de la sidebar : a son propre sélecteur de mois (MTD courant
+    # + 11 mois précédents complets). Compare auto à M-1 équivalent.
+    _exec_months = _months_for_exec_selector(12)
+    _exec_labels = [m[0] for m in _exec_months]
+    _selected_label = st.selectbox(
+        "📅 Mois à analyser",
+        options=_exec_labels,
+        index=0,  # défaut = mois courant en MTD
+        key="exec_month_selector",
+        help="Indépendant de la sidebar. Compare auto à M-1 équivalent.",
+    )
+    _selected_idx = _exec_labels.index(_selected_label)
+    _exec_p_start = _exec_months[_selected_idx][1]
+    _exec_p_end   = _exec_months[_selected_idx][2]
+
     with st.spinner("Executive Summary…"):
         try:
-            df_exec = run_query(exec_summary_sql())
-            st.markdown(render_exec_summary(df_exec), unsafe_allow_html=True)
+            df_exec = run_query(exec_summary_sql(_exec_p_start, _exec_p_end))
+            st.markdown(
+                render_exec_summary(df_exec, _exec_p_start, _exec_p_end),
+                unsafe_allow_html=True,
+            )
         except Exception as e:
             st.error(f"Erreur Executive Summary : {e}")
 
