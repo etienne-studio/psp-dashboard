@@ -3183,6 +3183,566 @@ def render_exec_summary(df: pd.DataFrame, period_start: date, period_end: date) 
 
 
 # ---------------------------------------------------------------------------
+# Executive Summary BILLING — onglet par semaine (vs S-1)
+#
+# Layout: 3 sections colorées (Processing / Success Rate / VAMP), 7 colonnes
+# Conciergerie × PSP + Total à droite. Sélecteur de semaine dédié.
+# ---------------------------------------------------------------------------
+
+def _weeks_for_billing_selector(n: int = 12) -> list:
+    """Retourne (label, week_start, week_end) pour les n dernières semaines.
+
+      - Idx 0 = semaine courante en WTD (lundi → hier) si on est pas lundi
+      - Idx 1+ = semaines complètes précédentes (lundi → dimanche)
+
+    Week labels FR: 'S21 (18/05 → 24/05)'."""
+    today = date.today()
+    # Lundi de la semaine courante
+    cur_monday = today - timedelta(days=today.weekday())
+    out = []
+    for i in range(n):
+        if i == 0:
+            # Semaine courante en WTD
+            w_start = cur_monday
+            w_end = today - timedelta(days=1)
+            if w_end < w_start:
+                # On est lundi → WTD = 0 jour. Skip.
+                continue
+            iso_week = w_start.isocalendar()[1]
+            label = (
+                f"S{iso_week:02d} — WTD ({w_start.strftime('%d/%m')} "
+                f"→ {w_end.strftime('%d/%m')})"
+            )
+        else:
+            # Semaine complète : i semaines en arrière
+            w_start = cur_monday - timedelta(days=7 * i)
+            w_end = w_start + timedelta(days=6)
+            iso_week = w_start.isocalendar()[1]
+            label = (
+                f"S{iso_week:02d} ({w_start.strftime('%d/%m')} "
+                f"→ {w_end.strftime('%d/%m')}) — complète"
+            )
+        out.append((label, w_start, w_end))
+    return out
+
+
+def _exec_billing_period_bounds(week_start: date, week_end: date) -> tuple:
+    """Bornes (s1_start, s1_end, s2_start, s2_end) pour la semaine sélectionnée
+    et la semaine précédente (même nombre de jours pour les WTD).
+    """
+    days_in_window = (week_end - week_start).days + 1
+    s2_start = week_start - timedelta(days=7)
+    s2_end = s2_start + timedelta(days=days_in_window - 1)
+    return week_start, week_end, s2_start, s2_end
+
+
+def exec_billing_sql(s1_start: date, s1_end: date,
+                     s2_start: date, s2_end: date) -> str:
+    """SQL Executive Summary Billing — atomes par (conciergerie, psp, bucket).
+
+    Buckets : s1 (semaine sélectionnée) et s2 (semaine précédente).
+
+    Atomes retournés (en long format) :
+      Processing :
+        - ca_brut        : SUM(amount succeeded) by t_date
+        - ca_refund      : SUM(amount refunded)  by refunded_at_utc
+      Success Rate R1 :
+        - r1_fa_tx, r1_fa_succ_tx        : 1ère tentative R1 (au niveau tx)
+        - r1_att_users, r1_succ_users    : users avec ≥1 tx R1 attempt / success
+      Success Rate Total (toutes R indexes) :
+        - all_fa_tx, all_fa_succ_tx      : 1ère tentative toutes R (au niveau tx)
+        - all_att_users, all_succ_users  : users avec ≥1 tx attempt / success
+      VAMP :
+        - volume_succ_total              : # tx succeeded toutes cartes (R0 inclus)
+        - tx_succ_visa                   : # tx succeeded Visa+Delta
+        - tx_succ_mc                     : # tx succeeded MasterCard
+        - alerts_visa, alerts_mc         : # alertes par cardnetwork
+    """
+    def _conc(alias: str, col: str) -> str:
+        return (
+            f"CASE LOWER(SPLIT(COALESCE({alias}.{col}, ''), ' - ')[OFFSET(0)]) "
+            "  WHEN 'reserv-go'    THEN 'Reserv-Go' "
+            "  WHEN 'book-ici'     THEN 'Book-Ici' "
+            "  WHEN 'resadexa'     THEN 'Resadexa' "
+            "  WHEN 'rezaflash'    THEN 'Rezaflash' "
+            "  WHEN 'jumpaide.com' THEN 'Jumpaide' "
+            "  WHEN 'concimax'     THEN 'Concimax' "
+            "  WHEN 'rapidoxy'     THEN 'Rapidoxy' "
+            "  ELSE NULL END"
+        )
+
+    ft_conc = _conc("ft", "t_brand")
+    t_conc  = _conc("t",  "t_brand")
+
+    s1s, s1e, s2s, s2e = (d.isoformat() for d in (s1_start, s1_end, s2_start, s2_end))
+
+    return f"""
+WITH weeks_def AS (
+  SELECT
+    DATE '{s1s}' AS s1_start,
+    DATE '{s1e}' AS s1_end,
+    DATE '{s2s}' AS s2_start,
+    DATE '{s2e}' AS s2_end
+),
+ft_window AS (
+  SELECT
+    ft.transaction_id,
+    ft.t_date,
+    ft.transaction_amount,
+    ft.transaction_status,
+    ft.invoice_r_index,
+    ft.t_attempt_index,
+    ft.t_card_brand,
+    ft.customer_email,
+    ft.ms_default_psp AS psp,
+    {ft_conc} AS conciergerie,
+    CASE
+      WHEN ft.t_date BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
+      WHEN ft.t_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s2_end FROM weeks_def) THEN 's2'
+    END AS bucket
+  FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
+  WHERE ft.t_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
+),
+refund_window AS (
+  SELECT
+    ft.transaction_amount,
+    ft.ms_default_psp AS psp,
+    {ft_conc} AS conciergerie,
+    CASE
+      WHEN ft.refunded_at_utc BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
+      WHEN ft.refunded_at_utc BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s2_end FROM weeks_def) THEN 's2'
+    END AS bucket
+  FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
+  WHERE ft.is_refunded = TRUE
+    AND ft.refunded_at_utc BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
+),
+alerts_window AS (
+  SELECT
+    fa.transaction_id,
+    fa.cardnetwork,
+    t.ms_default_psp AS psp,
+    {t_conc} AS conciergerie,
+    CASE
+      WHEN fa.alerted_at BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
+      WHEN fa.alerted_at BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s2_end FROM weeks_def) THEN 's2'
+    END AS bucket
+  FROM `eu-andy-marketing-raw.dashboard.fact_alert` fa
+  JOIN `eu-andy-marketing-raw.dashboard.fact_transactions` t USING (transaction_id)
+  WHERE fa.alerted_at BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
+),
+-- Processing
+proc_metrics AS (
+  SELECT conciergerie, psp, bucket, 'ca_brut' AS metric,
+    SUM(CASE WHEN transaction_status='succeeded' THEN transaction_amount ELSE 0 END) AS value
+  FROM ft_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+  UNION ALL
+  SELECT conciergerie, psp, bucket, 'ca_refund' AS metric, SUM(transaction_amount) AS value
+  FROM refund_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+),
+-- Success Rate R1 (au niveau R1 spécifiquement)
+sr_r1_metrics AS (
+  SELECT conciergerie, psp, bucket, 'r1_fa_tx' AS metric,
+    CAST(COUNT(DISTINCT CASE WHEN invoice_r_index='1' AND t_attempt_index=1 THEN transaction_id END) AS FLOAT64) AS value
+  FROM ft_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+  UNION ALL
+  SELECT conciergerie, psp, bucket, 'r1_fa_succ_tx',
+    CAST(COUNT(DISTINCT CASE WHEN invoice_r_index='1' AND t_attempt_index=1 AND transaction_status='succeeded' THEN transaction_id END) AS FLOAT64)
+  FROM ft_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+  UNION ALL
+  SELECT conciergerie, psp, bucket, 'r1_att_users',
+    CAST(COUNT(DISTINCT CASE WHEN invoice_r_index='1' THEN customer_email END) AS FLOAT64)
+  FROM ft_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+  UNION ALL
+  SELECT conciergerie, psp, bucket, 'r1_succ_users',
+    CAST(COUNT(DISTINCT CASE WHEN invoice_r_index='1' AND transaction_status='succeeded' THEN customer_email END) AS FLOAT64)
+  FROM ft_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+),
+-- Success Rate Total (toutes R indexes confondues)
+sr_all_metrics AS (
+  SELECT conciergerie, psp, bucket, 'all_fa_tx' AS metric,
+    CAST(COUNT(DISTINCT CASE WHEN t_attempt_index=1 THEN transaction_id END) AS FLOAT64) AS value
+  FROM ft_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+  UNION ALL
+  SELECT conciergerie, psp, bucket, 'all_fa_succ_tx',
+    CAST(COUNT(DISTINCT CASE WHEN t_attempt_index=1 AND transaction_status='succeeded' THEN transaction_id END) AS FLOAT64)
+  FROM ft_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+  UNION ALL
+  SELECT conciergerie, psp, bucket, 'all_att_users',
+    CAST(COUNT(DISTINCT customer_email) AS FLOAT64)
+  FROM ft_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+  UNION ALL
+  SELECT conciergerie, psp, bucket, 'all_succ_users',
+    CAST(COUNT(DISTINCT CASE WHEN transaction_status='succeeded' THEN customer_email END) AS FLOAT64)
+  FROM ft_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+),
+-- VAMP : volume (toutes cartes) + volumes Visa & MC + alertes Visa & MC
+vamp_metrics AS (
+  SELECT conciergerie, psp, bucket, 'volume_succ_total' AS metric,
+    CAST(COUNT(DISTINCT CASE WHEN transaction_status='succeeded' THEN transaction_id END) AS FLOAT64) AS value
+  FROM ft_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+  UNION ALL
+  SELECT conciergerie, psp, bucket, 'tx_succ_visa',
+    CAST(COUNT(DISTINCT CASE WHEN transaction_status='succeeded' AND UPPER(t_card_brand) IN ('VISA','DELTA') THEN transaction_id END) AS FLOAT64)
+  FROM ft_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+  UNION ALL
+  SELECT conciergerie, psp, bucket, 'tx_succ_mc',
+    CAST(COUNT(DISTINCT CASE WHEN transaction_status='succeeded' AND UPPER(t_card_brand) IN ('MASTERCARD','MC') THEN transaction_id END) AS FLOAT64)
+  FROM ft_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+  UNION ALL
+  SELECT conciergerie, psp, bucket, 'alerts_visa',
+    CAST(COUNT(DISTINCT transaction_id) AS FLOAT64)
+  FROM alerts_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL
+    AND UPPER(cardnetwork) = 'VISA'
+  GROUP BY 1,2,3
+  UNION ALL
+  SELECT conciergerie, psp, bucket, 'alerts_mc',
+    CAST(COUNT(DISTINCT transaction_id) AS FLOAT64)
+  FROM alerts_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL
+    AND UPPER(cardnetwork) = 'MASTERCARD'
+  GROUP BY 1,2,3
+)
+SELECT * FROM proc_metrics
+UNION ALL SELECT * FROM sr_r1_metrics
+UNION ALL SELECT * FROM sr_all_metrics
+UNION ALL SELECT * FROM vamp_metrics
+"""
+
+
+def render_exec_billing(df: pd.DataFrame,
+                         s1_start: date, s1_end: date,
+                         s2_start: date, s2_end: date) -> str:
+    """Render le tab Executive Summary Billing — 3 sections colorées."""
+    if df.empty:
+        return "<div style='color:#64748b;padding:12px;'>Aucune donnée</div>"
+
+    # Pivot {(conc, psp, bucket): {metric: value}}
+    data: dict = {}
+    for _, r in df.iterrows():
+        key = (r["conciergerie"], r["psp"], r["bucket"])
+        try:
+            v = float(r["value"]) if pd.notna(r["value"]) else 0.0
+        except (TypeError, ValueError):
+            v = 0.0
+        data.setdefault(key, {})[r["metric"]] = v
+
+    def m(c, p, b, metric):
+        return data.get((c, p, b), {}).get(metric, 0.0)
+
+    # --- Formatters FR ---
+    def fr_int(v):
+        return f"{int(round(v)):,}".replace(",", " ")
+
+    def fr_pct(v):
+        return f"{v*100:.1f}%".replace(".", ",")
+
+    def fr_eur(v):
+        if abs(v) >= 1000:
+            return f"{v/1000:,.1f} K€".replace(",", " ").replace(".", ",")
+        return f"{v:,.0f} €".replace(",", " ")
+
+    def wow_pct(curr, prev):
+        if prev is None or prev == 0 or curr is None:
+            return None
+        return (curr - prev) / prev
+
+    def wow_html(pct, lower_is_better=False):
+        if pct is None:
+            return "<span class='exec-wow-neutral'>—</span>"
+        sign = "+" if pct >= 0 else ""
+        is_good = (pct < 0) if lower_is_better else (pct > 0)
+        if pct == 0:
+            cls = "exec-wow-neutral"
+        else:
+            cls = "exec-wow-good" if is_good else "exec-wow-bad"
+        return f"<span class='{cls}'>{sign}{pct*100:.1f}%</span>".replace(".", ",")
+
+    # --- Header (7 paires + Total) ---
+    header_cells = "".join(
+        "<th>"
+        f"<div class='exec-th-conc'>{c}</div>"
+        f"<div class='exec-th-psp'>({lbl})</div>"
+        "</th>"
+        for (c, p, lbl) in EXEC_PSP_PAIRS
+    )
+    header_cells += (
+        "<th class='exec-th-total'>"
+        "<div class='exec-th-conc'>Total</div>"
+        "<div class='exec-th-psp'>(7 paires)</div>"
+        "</th>"
+    )
+
+    def _sum_atom(b, atom):
+        return sum(m(c, p, b, atom) for (c, p, _l) in EXEC_PSP_PAIRS)
+
+    # --- KPI row builder ---
+    def kpi_row(label, fmt, compute_fn, total_fn=None, lower_is_better=False,
+                section_class=""):
+        cells = []
+        for (c, p, _lbl) in EXEC_PSP_PAIRS:
+            v1 = compute_fn(c, p, "s1")
+            v2 = compute_fn(c, p, "s2")
+            value_str = fmt(v1) if v1 is not None else "—"
+            delta_str = wow_html(
+                wow_pct(v1, v2) if (v1 is not None and v2 is not None) else None,
+                lower_is_better=lower_is_better
+            )
+            cells.append(
+                f"<td><div class='exec-cell-val'>{value_str}</div>"
+                f"<div class='exec-cell-wow'>{delta_str}</div></td>"
+            )
+        if total_fn is not None:
+            t1 = total_fn("s1")
+            t2 = total_fn("s2")
+            t_value_str = fmt(t1) if t1 is not None else "—"
+            t_delta_str = wow_html(
+                wow_pct(t1, t2) if (t1 is not None and t2 is not None) else None,
+                lower_is_better=lower_is_better
+            )
+            cells.append(
+                f"<td class='exec-total-cell'>"
+                f"<div class='exec-cell-val'>{t_value_str}</div>"
+                f"<div class='exec-cell-wow'>{t_delta_str}</div></td>"
+            )
+        return f"<tr class='{section_class}'><td class='exec-kpi-label'>{label}</td>{''.join(cells)}</tr>"
+
+    def section_header(label, color_class):
+        n_cols = len(EXEC_PSP_PAIRS) + 2  # KPI col + 7 paires + Total
+        return (
+            f"<tr class='billing-section-header {color_class}'>"
+            f"<td colspan='{n_cols}'>{label}</td></tr>"
+        )
+
+    def subsection_header(label, color_class):
+        n_cols = len(EXEC_PSP_PAIRS) + 2
+        return (
+            f"<tr class='billing-subsection-header {color_class}'>"
+            f"<td colspan='{n_cols}'>{label}</td></tr>"
+        )
+
+    # ========================================================================
+    # Section 1 — PROCESSING (CA Brut, Refund, CA Net)
+    # ========================================================================
+    proc_rows = []
+    proc_rows.append(section_header("💰 PROCESSING", "billing-proc"))
+    proc_rows.append(kpi_row(
+        "CA Brut", fr_eur,
+        lambda c, p, b: m(c, p, b, "ca_brut"),
+        total_fn=lambda b: _sum_atom(b, "ca_brut"),
+        lower_is_better=False, section_class="billing-proc-row"
+    ))
+    proc_rows.append(kpi_row(
+        "Refund (€)", fr_eur,
+        lambda c, p, b: m(c, p, b, "ca_refund"),
+        total_fn=lambda b: _sum_atom(b, "ca_refund"),
+        lower_is_better=True, section_class="billing-proc-row"
+    ))
+    proc_rows.append(kpi_row(
+        "CA Net", fr_eur,
+        lambda c, p, b: m(c, p, b, "ca_brut") - m(c, p, b, "ca_refund"),
+        total_fn=lambda b: _sum_atom(b, "ca_brut") - _sum_atom(b, "ca_refund"),
+        lower_is_better=False, section_class="billing-proc-row billing-proc-row-emph"
+    ))
+
+    # ========================================================================
+    # Section 2 — SUCCESS RATE
+    # ========================================================================
+    sr_rows = []
+    sr_rows.append(section_header("✅ SUCCESS RATE", "billing-sr"))
+
+    # Sub-section R1
+    sr_rows.append(subsection_header("R1", "billing-sr-sub"))
+
+    def _sr_r1_fa(c, p, b):
+        denom = m(c, p, b, "r1_fa_tx")
+        return None if denom == 0 else m(c, p, b, "r1_fa_succ_tx") / denom
+
+    def _sr_r1_pu(c, p, b):
+        denom = m(c, p, b, "r1_att_users")
+        return None if denom == 0 else m(c, p, b, "r1_succ_users") / denom
+
+    def _sr_r1_fa_total(b):
+        denom = _sum_atom(b, "r1_fa_tx")
+        return None if denom == 0 else _sum_atom(b, "r1_fa_succ_tx") / denom
+
+    def _sr_r1_pu_total(b):
+        denom = _sum_atom(b, "r1_att_users")
+        return None if denom == 0 else _sum_atom(b, "r1_succ_users") / denom
+
+    sr_rows.append(kpi_row(
+        "Success Rate R1 — First Attempt", fr_pct, _sr_r1_fa,
+        total_fn=_sr_r1_fa_total, lower_is_better=False,
+        section_class="billing-sr-row"
+    ))
+    sr_rows.append(kpi_row(
+        "Success Rate R1 — Per User", fr_pct, _sr_r1_pu,
+        total_fn=_sr_r1_pu_total, lower_is_better=False,
+        section_class="billing-sr-row"
+    ))
+
+    # Sub-section Total (toutes R indexes)
+    sr_rows.append(subsection_header("Total (toutes R indexes)", "billing-sr-sub"))
+
+    def _sr_all_fa(c, p, b):
+        denom = m(c, p, b, "all_fa_tx")
+        return None if denom == 0 else m(c, p, b, "all_fa_succ_tx") / denom
+
+    def _sr_all_pu(c, p, b):
+        denom = m(c, p, b, "all_att_users")
+        return None if denom == 0 else m(c, p, b, "all_succ_users") / denom
+
+    def _sr_all_fa_total(b):
+        denom = _sum_atom(b, "all_fa_tx")
+        return None if denom == 0 else _sum_atom(b, "all_fa_succ_tx") / denom
+
+    def _sr_all_pu_total(b):
+        denom = _sum_atom(b, "all_att_users")
+        return None if denom == 0 else _sum_atom(b, "all_succ_users") / denom
+
+    sr_rows.append(kpi_row(
+        "Success Rate — First Attempt", fr_pct, _sr_all_fa,
+        total_fn=_sr_all_fa_total, lower_is_better=False,
+        section_class="billing-sr-row"
+    ))
+    sr_rows.append(kpi_row(
+        "Success Rate — Per User", fr_pct, _sr_all_pu,
+        total_fn=_sr_all_pu_total, lower_is_better=False,
+        section_class="billing-sr-row"
+    ))
+
+    # ========================================================================
+    # Section 3 — VAMP
+    # ========================================================================
+    vamp_rows = []
+    vamp_rows.append(section_header("⚠️ VAMP", "billing-vamp"))
+
+    # Volumes
+    vamp_rows.append(subsection_header("Volumes", "billing-vamp-sub"))
+    vamp_rows.append(kpi_row(
+        "Volume tx succeeded (total)", fr_int,
+        lambda c, p, b: m(c, p, b, "volume_succ_total"),
+        total_fn=lambda b: _sum_atom(b, "volume_succ_total"),
+        lower_is_better=False, section_class="billing-vamp-row"
+    ))
+    vamp_rows.append(kpi_row(
+        "Nb d'alertes VISA", fr_int,
+        lambda c, p, b: m(c, p, b, "alerts_visa"),
+        total_fn=lambda b: _sum_atom(b, "alerts_visa"),
+        lower_is_better=True, section_class="billing-vamp-row"
+    ))
+    vamp_rows.append(kpi_row(
+        "Nb d'alertes MC", fr_int,
+        lambda c, p, b: m(c, p, b, "alerts_mc"),
+        total_fn=lambda b: _sum_atom(b, "alerts_mc"),
+        lower_is_better=True, section_class="billing-vamp-row"
+    ))
+
+    # Taux
+    vamp_rows.append(subsection_header("Taux", "billing-vamp-sub"))
+
+    def _vamp_visa(c, p, b):
+        denom = m(c, p, b, "tx_succ_visa")
+        return None if denom == 0 else m(c, p, b, "alerts_visa") / denom
+
+    def _vamp_mc(c, p, b):
+        denom = m(c, p, b, "tx_succ_mc")
+        return None if denom == 0 else m(c, p, b, "alerts_mc") / denom
+
+    def _vamp_visa_total(b):
+        denom = _sum_atom(b, "tx_succ_visa")
+        return None if denom == 0 else _sum_atom(b, "alerts_visa") / denom
+
+    def _vamp_mc_total(b):
+        denom = _sum_atom(b, "tx_succ_mc")
+        return None if denom == 0 else _sum_atom(b, "alerts_mc") / denom
+
+    vamp_rows.append(kpi_row(
+        "VAMP Ratio VISA", fr_pct, _vamp_visa,
+        total_fn=_vamp_visa_total, lower_is_better=True,
+        section_class="billing-vamp-row"
+    ))
+    vamp_rows.append(kpi_row(
+        "VAMP Ratio MC", fr_pct, _vamp_mc,
+        total_fn=_vamp_mc_total, lower_is_better=True,
+        section_class="billing-vamp-row"
+    ))
+
+    rows_html = "".join(proc_rows + sr_rows + vamp_rows)
+
+    table_html = (
+        "<table class='exec-table billing-table'>"
+        f"<thead><tr><th class='exec-kpi-label'>KPI</th>{header_cells}</tr></thead>"
+        f"<tbody>{rows_html}</tbody>"
+        "</table>"
+    )
+
+    # --- Bandeau période ---
+    days_in_window = (s1_end - s1_start).days + 1
+    iso_w1 = s1_start.isocalendar()[1]
+    iso_w2 = s2_start.isocalendar()[1]
+    if days_in_window < 7:
+        s1_label = f"<b>S{iso_w1:02d} WTD :</b> {s1_start.strftime('%d/%m')} → {s1_end.strftime('%d/%m')} ({days_in_window}j)"
+        s2_label = f"<b>S{iso_w2:02d} WTD-1 :</b> {s2_start.strftime('%d/%m')} → {s2_end.strftime('%d/%m')}"
+    else:
+        s1_label = f"<b>S{iso_w1:02d} :</b> {s1_start.strftime('%d/%m')} → {s1_end.strftime('%d/%m')}"
+        s2_label = f"<b>S{iso_w2:02d} (S-1) :</b> {s2_start.strftime('%d/%m')} → {s2_end.strftime('%d/%m')}"
+    period_label = f"{s1_label} &middot; {s2_label}"
+
+    css_extra = """
+    <style>
+      /* Section headers : 3 couleurs distinctes pour PROCESSING / SR / VAMP */
+      .billing-section-header td {
+        font-size: 13px !important;
+        font-weight: 700 !important;
+        text-transform: uppercase !important;
+        padding: 10px 14px !important;
+        letter-spacing: 0.06em !important;
+        text-align: left !important;
+        color: white !important;
+        border-top: 2px solid white !important;
+      }
+      .billing-section-header.billing-proc td { background: #047857 !important; }   /* émeraude */
+      .billing-section-header.billing-sr   td { background: #1d4ed8 !important; }   /* bleu */
+      .billing-section-header.billing-vamp td { background: #b91c1c !important; }   /* rouge */
+
+      /* Sub-section headers (R1, Total, Volumes, Taux) */
+      .billing-subsection-header td {
+        font-size: 11px !important;
+        font-weight: 700 !important;
+        text-transform: uppercase !important;
+        padding: 6px 14px !important;
+        letter-spacing: 0.05em !important;
+        text-align: left !important;
+        color: #475569 !important;
+        background: #f1f5f9 !important;
+        border-top: 1px solid #cbd5e1 !important;
+        border-bottom: 1px solid #cbd5e1 !important;
+      }
+
+      /* Tinted backgrounds par section pour aider la lecture */
+      .billing-table tbody tr.billing-proc-row td { background: #ecfdf5 !important; }
+      .billing-table tbody tr.billing-sr-row   td { background: #eff6ff !important; }
+      .billing-table tbody tr.billing-vamp-row td { background: #fef2f2 !important; }
+      /* Total cells overrides */
+      .billing-table tbody tr.billing-proc-row td.exec-total-cell { background: #d1fae5 !important; }
+      .billing-table tbody tr.billing-sr-row   td.exec-total-cell { background: #dbeafe !important; }
+      .billing-table tbody tr.billing-vamp-row td.exec-total-cell { background: #fee2e2 !important; }
+      /* Emphase CA Net (ligne avec un fond plus marqué) */
+      .billing-table tbody tr.billing-proc-row-emph td { background: #d1fae5 !important; font-weight: 600 !important; }
+      .billing-table tbody tr.billing-proc-row-emph td.exec-total-cell { background: #a7f3d0 !important; }
+    </style>
+    """
+
+    return (
+        css_extra
+        + "<div class='exec-summary'>"
+        + f"<div class='exec-period'>📅 {period_label}</div>"
+        + "<h3 class='exec-section'>Executive Summary Billing — par semaine vs S-1</h3>"
+        + table_html
+        + "</div>"
+    )
+
+
+# ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 st.title("📊 Weekly PSP Report")
@@ -3305,8 +3865,8 @@ header_html = f"""
 st.markdown(header_html, unsafe_allow_html=True)
 
 # Tabs
-tab_exec, tab_b, tab_m, tab_vc, tab_vd = st.tabs(
-    ["Executive Summary", "Funnel Booking", "Funnel Magazine", "VAMP Cohort", "VAMP Date"]
+tab_exec, tab_billing, tab_b, tab_m, tab_vc, tab_vd = st.tabs(
+    ["Executive Summary", "Executive Summary Billing", "Funnel Booking", "Funnel Magazine", "VAMP Cohort", "VAMP Date"]
 )
 
 with tab_exec:
@@ -3334,6 +3894,33 @@ with tab_exec:
             )
         except Exception as e:
             st.error(f"Erreur Executive Summary : {e}")
+
+with tab_billing:
+    # Indépendant de la sidebar : son propre sélecteur de semaine (WTD courant
+    # + 11 semaines précédentes complètes). Comparaison vs S-1.
+    _billing_weeks = _weeks_for_billing_selector(12)
+    _billing_labels = [w[0] for w in _billing_weeks]
+    _billing_sel_label = st.selectbox(
+        "📅 Semaine à analyser",
+        options=_billing_labels,
+        index=0,
+        key="billing_week_selector",
+        help="Indépendant de la sidebar. Compare auto à la semaine précédente (S-1).",
+    )
+    _billing_sel_idx = _billing_labels.index(_billing_sel_label)
+    _b_w_start = _billing_weeks[_billing_sel_idx][1]
+    _b_w_end   = _billing_weeks[_billing_sel_idx][2]
+    _b_s1s, _b_s1e, _b_s2s, _b_s2e = _exec_billing_period_bounds(_b_w_start, _b_w_end)
+
+    with st.spinner("Executive Summary Billing…"):
+        try:
+            df_billing = run_query(exec_billing_sql(_b_s1s, _b_s1e, _b_s2s, _b_s2e))
+            st.markdown(
+                render_exec_billing(df_billing, _b_s1s, _b_s1e, _b_s2s, _b_s2e),
+                unsafe_allow_html=True,
+            )
+        except Exception as e:
+            st.error(f"Erreur Executive Summary Billing : {e}")
 
 with tab_b:
     with st.spinner("Funnel Booking…"):
