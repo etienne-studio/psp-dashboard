@@ -2940,7 +2940,7 @@ def render_exec_summary(df: pd.DataFrame, period_start: date, period_end: date) 
         )
     cards_html = "<div class='exec-cards'>" + "".join(cards) + "</div>"
 
-    # --- Bottom: KPI table ---
+    # --- Bottom: KPI table (colonne Total à droite) ---
     header_cells = "".join(
         "<th>"
         f"<div class='exec-th-conc'>{c}</div>"
@@ -2948,8 +2948,9 @@ def render_exec_summary(df: pd.DataFrame, period_start: date, period_end: date) 
         "</th>"
         for (c, p, lbl) in EXEC_PSP_PAIRS
     )
+    header_cells += "<th class='exec-th-total'><div class='exec-th-conc'>Total</div><div class='exec-th-psp'>(7 paires)</div></th>"
 
-    def kpi_row(label, fmt, compute_fn, lower_is_better=False):
+    def kpi_row(label, fmt, compute_fn, total_fn=None, lower_is_better=False):
         cells = []
         for (c, p, _lbl) in EXEC_PSP_PAIRS:
             v1 = compute_fn(c, p, "s1")
@@ -2961,8 +2962,22 @@ def render_exec_summary(df: pd.DataFrame, period_start: date, period_end: date) 
                 f"<td><div class='exec-cell-val'>{value_str}</div>"
                 f"<div class='exec-cell-wow'>{delta_str}</div></td>"
             )
+        # Cellule Total (recalcule depuis les atomes pour les ratios — somme
+        # des numérateurs / somme des dénominateurs, jamais moyenne de ratios).
+        if total_fn is not None:
+            t1 = total_fn("s1")
+            t2 = total_fn("s2")
+            t_value_str = fmt(t1) if t1 is not None else "—"
+            t_delta_str = wow_html(wow_pct(t1, t2) if (t1 is not None and t2 is not None) else None,
+                                   lower_is_better=lower_is_better)
+            cells.append(
+                f"<td class='exec-total-cell'>"
+                f"<div class='exec-cell-val'>{t_value_str}</div>"
+                f"<div class='exec-cell-wow'>{t_delta_str}</div></td>"
+            )
         return f"<tr><td class='exec-kpi-label'>{label}</td>{''.join(cells)}</tr>"
 
+    # ---- Compute fns par cellule (existants) ------------------------------
     def churn_fn(c, p, b):
         # Churn cohort = Booking memberships dont TrialEnd ∈ fenêtre.
         # INCLUT les cancelled-during-trial (= vrais churners). PAS un TBB.
@@ -2984,12 +2999,38 @@ def render_exec_summary(df: pd.DataFrame, period_start: date, period_end: date) 
         num   = m(c, p, b, "alerts_visa")
         return None if denom == 0 else num / denom
 
+    # ---- Total fns (agrégation correcte par KPI) --------------------------
+    def _sum_atom(b, atom):
+        return sum(m(c, p, b, atom) for (c, p, _l) in EXEC_PSP_PAIRS)
+
+    def total_r0(b):
+        return _sum_atom(b, "r0")
+
+    def total_ca_net(b):
+        return _sum_atom(b, "brut") - _sum_atom(b, "refund_rev")
+
+    def total_churn(b):
+        # SOMME des r1_net / SOMME des cohorts (pas moyenne de ratios !)
+        cohort_sum = _sum_atom(b, "churn_cohort_size")
+        r1_sum     = _sum_atom(b, "r1_net_count")
+        return None if cohort_sum == 0 else 1 - (r1_sum / cohort_sum)
+
+    def total_refund(b):
+        brut_sum   = _sum_atom(b, "brut")
+        refund_sum = _sum_atom(b, "refund_rev")
+        return None if brut_sum == 0 else refund_sum / brut_sum
+
+    def total_vamp(b):
+        denom_sum = _sum_atom(b, "tx_succ_visa")
+        num_sum   = _sum_atom(b, "alerts_visa")
+        return None if denom_sum == 0 else num_sum / denom_sum
+
     rows_html = "".join([
-        kpi_row("# R0 (customers)",        fr_int, lambda c, p, b: m(c, p, b, "r0"),                                lower_is_better=False),
-        kpi_row("€ CA Net",                fr_eur, lambda c, p, b: m(c, p, b, "brut") - m(c, p, b, "refund_rev"),    lower_is_better=False),
-        kpi_row("% Churn R0→R1 (Booking)", fr_pct, churn_fn,                                                          lower_is_better=True),
-        kpi_row("% Refund (CA)",           fr_pct, refund_fn,                                                         lower_is_better=True),
-        kpi_row("% VAMP Ratio (Visa)",     fr_pct, vamp_fn,                                                           lower_is_better=True),
+        kpi_row("# R0 (customers)",        fr_int, lambda c, p, b: m(c, p, b, "r0"),                                total_fn=total_r0,     lower_is_better=False),
+        kpi_row("€ CA Net",                fr_eur, lambda c, p, b: m(c, p, b, "brut") - m(c, p, b, "refund_rev"),    total_fn=total_ca_net, lower_is_better=False),
+        kpi_row("% Churn R0→R1 (Booking)", fr_pct, churn_fn,                                                          total_fn=total_churn,  lower_is_better=True),
+        kpi_row("% Refund (CA)",           fr_pct, refund_fn,                                                         total_fn=total_refund, lower_is_better=True),
+        kpi_row("% VAMP Ratio (Visa)",     fr_pct, vamp_fn,                                                           total_fn=total_vamp,   lower_is_better=True),
     ])
 
     table_html = (
@@ -3091,6 +3132,19 @@ def render_exec_summary(df: pd.DataFrame, period_start: date, period_end: date) 
         background: #1e293b;
       }
       .exec-th-conc { font-size: 13px; font-weight: 700; }
+      .exec-th-total {
+        border-left: 3px solid #475569 !important;
+        background: #1e293b !important;
+      }
+      .exec-total-cell {
+        border-left: 3px solid #475569 !important;
+        background: #f1f5f9 !important;
+        font-weight: 700;
+      }
+      .exec-total-cell .exec-cell-val {
+        font-size: 15px !important;
+        font-weight: 700 !important;
+      }
       .exec-th-psp  { font-size: 11px; opacity: 0.75; font-weight: 400; margin-top: 2px; }
       .exec-table tbody td {
         padding: 10px 12px;
