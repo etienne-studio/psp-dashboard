@@ -3689,7 +3689,7 @@ def render_exec_billing(df: pd.DataFrame,
 
     css_extra = """
     <style>
-      /* Section headers : 3 couleurs distinctes pour PROCESSING / SR / VAMP */
+      /* Section headers : bandeau sombre uppercase (segmente PROCESSING / SR / VAMP) */
       .billing-section-header td {
         font-size: 13px !important;
         font-weight: 700 !important;
@@ -3698,11 +3698,9 @@ def render_exec_billing(df: pd.DataFrame,
         letter-spacing: 0.06em !important;
         text-align: left !important;
         color: white !important;
+        background: #0f172a !important;
         border-top: 2px solid white !important;
       }
-      .billing-section-header.billing-proc td { background: #047857 !important; }   /* émeraude */
-      .billing-section-header.billing-sr   td { background: #1d4ed8 !important; }   /* bleu */
-      .billing-section-header.billing-vamp td { background: #b91c1c !important; }   /* rouge */
 
       /* Sub-section headers (R1, Total, Volumes, Taux) */
       .billing-subsection-header td {
@@ -3717,18 +3715,6 @@ def render_exec_billing(df: pd.DataFrame,
         border-top: 1px solid #cbd5e1 !important;
         border-bottom: 1px solid #cbd5e1 !important;
       }
-
-      /* Tinted backgrounds par section pour aider la lecture */
-      .billing-table tbody tr.billing-proc-row td { background: #ecfdf5 !important; }
-      .billing-table tbody tr.billing-sr-row   td { background: #eff6ff !important; }
-      .billing-table tbody tr.billing-vamp-row td { background: #fef2f2 !important; }
-      /* Total cells overrides */
-      .billing-table tbody tr.billing-proc-row td.exec-total-cell { background: #d1fae5 !important; }
-      .billing-table tbody tr.billing-sr-row   td.exec-total-cell { background: #dbeafe !important; }
-      .billing-table tbody tr.billing-vamp-row td.exec-total-cell { background: #fee2e2 !important; }
-      /* Emphase CA Net (ligne avec un fond plus marqué) */
-      .billing-table tbody tr.billing-proc-row-emph td { background: #d1fae5 !important; font-weight: 600 !important; }
-      .billing-table tbody tr.billing-proc-row-emph td.exec-total-cell { background: #a7f3d0 !important; }
     </style>
     """
 
