@@ -1789,6 +1789,315 @@ FUNNEL_KPI_SECTIONS.append(("LTV Simulator", [
 ]))
 
 
+# ---------------------------------------------------------------------------
+# VAMP — listes de KPIs + sections (pour le graphe Plotly sous tabs VAMP)
+# ---------------------------------------------------------------------------
+
+# Mapping nom de section ↔ valeur de `cat` retournée par vamp_*_sql
+VAMP_CAT_MAP = [
+    ("Total",       "total"),
+    ("Rx Booking",  "rx_booking"),
+    ("R0 Micro",    "r0_micro"),
+    ("Rx Micro",    "rx_micro"),
+    ("Rx Magazine", "rx_magazine"),
+]
+
+ALL_VAMP_KPIS = []
+VAMP_KPI_SECTIONS = []
+for _section_name, _cat in VAMP_CAT_MAP:
+    _kpis = [
+        f"# Tx Succeeded ({_section_name})",
+        f"# Alertes ({_section_name})",
+        f"% VAMP ({_section_name})",
+    ]
+    ALL_VAMP_KPIS.extend(_kpis)
+    VAMP_KPI_SECTIONS.append((_section_name, _kpis))
+
+
+def vamp_graph_data(df: pd.DataFrame, time_dim_key: str,
+                    curve_dim_key: str | None,
+                    min_denom_for_ratios: int = 20) -> pd.DataFrame:
+    """Aggrège le df brut vamp_*_sql en tidy long DataFrame pour plotting.
+
+    Le df source contient 1 ligne par (week_start, dim_<time>, dim_<curve>, cat)
+    avec colonnes n_tx (tx succ) et n_al (alertes). On agrège par (time, curve)
+    et on dérive 15 KPIs : 5 catégories × {# Tx Succeeded, # Alertes, % VAMP}.
+
+    Returns tidy DataFrame (time, time_label, curve, kpi, value).
+    """
+    if df.empty:
+        return pd.DataFrame(columns=["time", "time_label", "curve", "kpi", "value"])
+
+    def _parse_time(s):
+        if pd.isna(s):
+            return None
+        try:
+            return pd.to_datetime(s).date()
+        except Exception:
+            return s
+
+    cells: dict = {}      # (t_key, c_val) → {cat → {n_tx, n_al}}
+    cell_labels: dict = {}
+
+    for _, r in df.iterrows():
+        t_key = _parse_time(r["week_start"])
+        t_label = r["week_label"]
+        c_val = _safe_str(r.get(f"dim_{curve_dim_key}", "")) if curve_dim_key else "Total"
+        if c_val == "":
+            c_val = "(empty)"
+        key = (t_key, c_val)
+        if key not in cells:
+            cells[key] = {}
+            cell_labels[key] = t_label
+        cat = r["cat"]
+        acc = cells[key].setdefault(cat, {"n_tx": 0, "n_al": 0})
+        acc["n_tx"] += int(r["n_tx"])
+        acc["n_al"] += int(r["n_al"])
+
+    def _ratio(num, denom):
+        if denom is None or denom == 0 or denom < min_denom_for_ratios:
+            return None
+        return num / denom
+
+    rows = []
+    for (t_key, c_val), cats in cells.items():
+        t_label = cell_labels[(t_key, c_val)]
+        for section_name, cat_key in VAMP_CAT_MAP:
+            cat_data = cats.get(cat_key, {"n_tx": 0, "n_al": 0})
+            n_tx = cat_data["n_tx"]
+            n_al = cat_data["n_al"]
+            kpis = {
+                f"# Tx Succeeded ({section_name})": float(n_tx),
+                f"# Alertes ({section_name})":      float(n_al),
+                f"% VAMP ({section_name})":         _ratio(n_al, n_tx),
+            }
+            for kpi_name, val in kpis.items():
+                rows.append({
+                    "time": t_key,
+                    "time_label": t_label,
+                    "curve": c_val,
+                    "kpi": kpi_name,
+                    "value": val,
+                })
+
+    return pd.DataFrame(rows)
+
+
+def render_vamp_graph(vamp_kind: str, filters: dict, picked_start, picked_end,
+                     key_prefix: str) -> None:
+    """Render le graphe Plotly sous un tab VAMP (Cohort ou Date).
+
+    vamp_kind : 'cohort' ou 'date' → utilise vamp_cohort_sql ou vamp_date_sql.
+    Structure identique à render_funnel_graph (KPI buttons gauche + chart droite)
+    mais avec ALL_VAMP_KPIS / VAMP_KPI_SECTIONS et vamp_graph_data en backend.
+    """
+    import plotly.express as px
+
+    st.markdown("### 📈 Évolution dans le temps")
+
+    # --- Top controls ---
+    ctrl1, ctrl2, _spacer = st.columns([1.5, 1.5, 4])
+    time_options = ["Date (jour)", "Date (semaine)", "Date (mois)"]
+    graph_time_label = ctrl1.selectbox(
+        "Granularité X", options=time_options, index=1,
+        key=f"{key_prefix}_graph_time",
+        help="Granularité de l'axe X (indépendant de la sidebar)",
+    )
+    _NONE_GRAPH = "— aucune (agrégé) —"
+    curve_options = [_NONE_GRAPH] + [d[1] for d in DIMENSION_DIMS if d[0] not in _DATE_DIM_KEYS]
+    graph_curve_label = ctrl2.selectbox(
+        "Dim courbe", options=curve_options, index=0,
+        key=f"{key_prefix}_graph_curve",
+        help="Une courbe par valeur de cette dim. « Aucune » = une seule courbe agrégée.",
+    )
+
+    graph_time_dim = next(d for d in DIMENSION_DIMS if d[1] == graph_time_label)
+    if graph_curve_label != _NONE_GRAPH:
+        graph_curve_dim = next(d for d in DIMENSION_DIMS if d[1] == graph_curve_label)
+        graph_dims_list = [graph_time_dim, graph_curve_dim]
+        curve_key = graph_curve_dim[0]
+    else:
+        graph_curve_dim = None
+        graph_dims_list = [graph_time_dim]
+        curve_key = None
+
+    graph_weeks_list = periods_in_range(picked_start, picked_end, graph_time_dim[0])
+    if not graph_weeks_list:
+        st.info("Plage de dates vide pour cette granularité.")
+        return
+
+    sql_fn = vamp_cohort_sql if vamp_kind == "cohort" else vamp_date_sql
+    pretty_kind = "Cohort" if vamp_kind == "cohort" else "Date"
+
+    with st.spinner("Graphe…"):
+        try:
+            raw_df = run_query(sql_fn(filters, graph_dims_list, graph_weeks_list))
+            graph_df = vamp_graph_data(raw_df, graph_time_dim[0], curve_key)
+        except Exception as e:
+            st.error(f"Erreur graphe : {e}")
+            return
+
+    if graph_df.empty:
+        st.info("Aucune donnée pour ce périmètre.")
+        return
+
+    has_data = (
+        graph_df.dropna(subset=["value"])
+        .groupby("kpi")
+        .size()
+        .reset_index(name="n")
+    )
+    available = set(has_data["kpi"].tolist())
+    if not available:
+        st.info("Aucun KPI avec données sur cette plage.")
+        return
+
+    # --- Selected KPI state ---
+    state_key = f"{key_prefix}_graph_kpi"
+    if state_key not in st.session_state or st.session_state[state_key] not in available:
+        # Défaut : "# Tx Succeeded (Total)"
+        if "# Tx Succeeded (Total)" in available:
+            st.session_state[state_key] = "# Tx Succeeded (Total)"
+        else:
+            ordered_available = [k for k in ALL_VAMP_KPIS if k in available]
+            st.session_state[state_key] = ordered_available[0] if ordered_available else None
+
+    # CSS partagé avec le funnel graph (même classe `.psp-kpi-buttons`).
+    st.markdown(
+        """
+        <style>
+          .psp-kpi-buttons div[data-testid="stVerticalBlock"] { gap: 2px; }
+          .psp-kpi-buttons div.stButton > button {
+            text-align: left; justify-content: flex-start;
+            font-size: 12px; padding: 4px 10px; border-radius: 4px;
+            font-weight: 400; min-height: 0; line-height: 1.3;
+            width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+          }
+          .psp-kpi-buttons div.stButton > button p { font-size: 12px; margin: 0; }
+          .psp-kpi-section-header {
+            font-size: 11px; font-weight: 700; text-transform: uppercase;
+            color: white; background: #0f172a; padding: 6px 10px;
+            margin: 8px 0 4px 0; border-radius: 4px; letter-spacing: 0.04em;
+          }
+          .psp-kpi-section-header:first-child { margin-top: 0; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    col_kpi, col_chart = st.columns([1.6, 4.4])
+    with col_kpi:
+        st.markdown('<div class="psp-kpi-buttons">', unsafe_allow_html=True)
+        with st.container(height=520, border=False):
+            for section_name, section_kpis in VAMP_KPI_SECTIONS:
+                visible_kpis = [k for k in section_kpis if k in available]
+                if not visible_kpis:
+                    continue
+                st.markdown(
+                    f'<div class="psp-kpi-section-header">{section_name}</div>',
+                    unsafe_allow_html=True,
+                )
+                for kpi in visible_kpis:
+                    is_active = (kpi == st.session_state[state_key])
+                    if st.button(
+                        kpi,
+                        key=f"{key_prefix}_kpi_btn_{kpi}",
+                        type="primary" if is_active else "secondary",
+                        use_container_width=True,
+                    ):
+                        st.session_state[state_key] = kpi
+                        st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    selected_kpi = st.session_state[state_key]
+
+    with col_chart:
+        plot_data = graph_df[graph_df["kpi"] == selected_kpi].copy()
+        if plot_data.dropna(subset=["value"]).empty:
+            st.info(f"Aucune donnée pour {selected_kpi} sur cette plage "
+                    f"(possible : dénominateur < 20 sur tous les points).")
+            return
+
+        is_pct = selected_kpi.startswith("%")
+        if is_pct:
+            plot_data["value"] = plot_data["value"] * 100
+
+        plot_data = plot_data.sort_values("time")
+
+        palette = (
+            px.colors.qualitative.D3
+            + px.colors.qualitative.Set2
+            + px.colors.qualitative.Set3
+        )
+
+        fig = px.line(
+            plot_data, x="time", y="value", color="curve",
+            markers=True, color_discrete_sequence=palette,
+            hover_data={"time_label": True, "time": False, "value": ":.2f"},
+            labels={
+                "time": graph_time_label, "value": selected_kpi,
+                "curve": graph_curve_label if graph_curve_dim else "Série",
+            },
+        )
+        if is_pct:
+            fig.update_yaxes(ticksuffix=" %", tickformat=".2f")
+        else:
+            fig.update_yaxes(tickformat=",d", separatethousands=True)
+
+        fig.update_traces(
+            mode="lines+markers",
+            line=dict(width=2.5),
+            marker=dict(size=7, line=dict(width=1, color="white")),
+            connectgaps=False,
+            hovertemplate=(
+                "<b>%{fullData.name}</b><br>"
+                + "%{customdata[0]}<br>"
+                + f"{selected_kpi} : %{{y:,.2f}}"
+                + (" %" if is_pct else "")
+                + "<extra></extra>"
+            ),
+        )
+
+        fig.update_layout(
+            title=dict(
+                text=f"<b>{selected_kpi}</b>  ·  VAMP {pretty_kind}",
+                x=0.0, xanchor="left",
+                font=dict(size=15, color="#0f172a"),
+            ),
+            height=520,
+            margin=dict(l=10, r=10, t=60, b=40),
+            plot_bgcolor="white", paper_bgcolor="white",
+            hovermode="x unified",
+            xaxis=dict(
+                showgrid=True, gridcolor="#f1f5f9", gridwidth=1,
+                showline=True, linecolor="#cbd5e1", linewidth=1,
+                ticks="outside", tickcolor="#94a3b8",
+                title=dict(font=dict(size=12, color="#475569")),
+            ),
+            yaxis=dict(
+                showgrid=True, gridcolor="#f1f5f9", gridwidth=1,
+                showline=True, linecolor="#cbd5e1", linewidth=1,
+                zeroline=True, zerolinecolor="#cbd5e1",
+                ticks="outside", tickcolor="#94a3b8",
+                title=dict(font=dict(size=12, color="#475569")),
+                rangemode="tozero" if not is_pct else "normal",
+            ),
+            legend=dict(
+                orientation="v", x=1.02, y=1, xanchor="left",
+                bgcolor="rgba(255,255,255,0.9)",
+                bordercolor="#e2e8f0", borderwidth=1,
+                font=dict(size=11),
+            ),
+            font=dict(family="-apple-system, BlinkMacSystemFont, sans-serif"),
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(
+            "💡 Points masqués : sur les **ratios % VAMP**, les cellules dont "
+            "le dénominateur (# Tx Succeeded) < 20 sont laissées vides."
+        )
+
+
 def funnel_graph_data(
     df: pd.DataFrame,
     time_dim_key: str,
@@ -3929,6 +4238,10 @@ with tab_m:
             st.markdown(render_table_html(table), unsafe_allow_html=True)
         except Exception as e:
             st.error(f"Erreur Funnel Magazine : {e}")
+    # Graph section under the table — own dim/granularity selectors, reuses
+    # sidebar filters + date range.
+    st.divider()
+    render_funnel_graph("Magazine", filters, _picked_start, _picked_end, key_prefix="magazine")
 
 with tab_vc:
     with st.spinner("VAMP Cohort…"):
@@ -3938,6 +4251,9 @@ with tab_vc:
             st.markdown(render_table_html(table), unsafe_allow_html=True)
         except Exception as e:
             st.error(f"Erreur VAMP Cohort : {e}")
+    # Graph section under the table
+    st.divider()
+    render_vamp_graph("cohort", filters, _picked_start, _picked_end, key_prefix="vamp_cohort")
 
 with tab_vd:
     with st.spinner("VAMP Date…"):
@@ -3947,3 +4263,6 @@ with tab_vd:
             st.markdown(render_table_html(table), unsafe_allow_html=True)
         except Exception as e:
             st.error(f"Erreur VAMP Date : {e}")
+    # Graph section under the table
+    st.divider()
+    render_vamp_graph("date", filters, _picked_start, _picked_end, key_prefix="vamp_date")
