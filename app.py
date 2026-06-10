@@ -1341,9 +1341,9 @@ dtx AS (
   UNION ALL SELECT tx_week, {dims_only_trailing}cat, COUNT(DISTINCT transaction_id) FROM tx_cat WHERE cat IS NOT NULL GROUP BY ALL
 ),
 al AS (
-  SELECT fa.transaction_id, DATE_TRUNC(fa.alerted_at, WEEK(MONDAY)) AS alert_week
+  SELECT fa.transaction_id, DATE_TRUNC(fa.alerted_at, {trunc_arg}) AS alert_week
   FROM `eu-andy-marketing-raw.dashboard.fact_alert` fa
-  WHERE DATE_TRUNC(fa.alerted_at, WEEK(MONDAY)) IN (SELECT week_start FROM weeks)
+  WHERE DATE_TRUNC(fa.alerted_at, {trunc_arg}) IN (SELECT week_start FROM weeks)
 ),
 al_tx AS (
   SELECT a.alert_week, t.transaction_id,
