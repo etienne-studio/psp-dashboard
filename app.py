@@ -1069,7 +1069,7 @@ bt AS (
   SELECT DISTINCT
     DATE_TRUNC(DATE(c.CreatedAtUtc), {trunc_arg}) AS cohort_week,
     ft.transaction_id, ft.customer_email, ft.membership_id, ft.invoice_r_index,
-    ft.transaction_status, ft.is_refunded, ft.t_attempt_index, ft.t_datetime,
+    ft.transaction_status, ft.is_refunded, ft.is_alerted, ft.t_attempt_index, ft.t_datetime,
     ft.ms_billing_frequency, ft.ms_billing_period
   FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
   JOIN `eu-andy-marketing-raw.silver_sgw.stg_customers` c ON ft.customer_id = c.Id
@@ -1158,7 +1158,11 @@ rx_stats AS (
     COUNT(DISTINCT customer_email) AS attempted_users,
     COUNT(DISTINCT CASE WHEN transaction_status='succeeded' THEN customer_email END) AS succ_users,
     COUNT(DISTINCT CASE WHEN is_refunded=TRUE AND transaction_status='succeeded' THEN transaction_id END) AS refund_tx,
-    COUNT(DISTINCT CASE WHEN is_refunded=TRUE AND transaction_status='succeeded' THEN customer_email END) AS refund_users
+    COUNT(DISTINCT CASE WHEN is_refunded=TRUE AND transaction_status='succeeded' THEN customer_email END) AS refund_users,
+    -- Net strict (= def Notion / Exec) : succeeded ET NI refundé NI alerté.
+    COUNT(DISTINCT CASE WHEN transaction_status='succeeded'
+        AND COALESCE(is_refunded, FALSE)=FALSE
+        AND COALESCE(is_alerted, FALSE)=FALSE THEN customer_email END) AS net_users
   FROM btx
   WHERE SAFE_CAST(invoice_r_index AS INT64) BETWEEN 1 AND 26
   GROUP BY ALL
@@ -1180,6 +1184,7 @@ SELECT
   COALESCE(s.succ_users, 0) AS succ_users,
   COALESCE(s.refund_tx, 0) AS refund_tx,
   COALESCE(s.refund_users, 0) AS refund_users,
+  COALESCE(s.net_users, 0) AS net_users,
   COALESCE(tbb.elig_users, 0) AS tbb_elig_users,
   COALESCE(tbb.cancel_users, 0) AS tbb_cancel_users
 FROM weeks w
@@ -1541,7 +1546,7 @@ def build_funnel_table(df: pd.DataFrame, brand_type: str, dims: list,
         rx = str(r["rx_idx"])
         rx_acc = by_group[g]["rx"].setdefault(rx, {
             "fa_u": 0, "fa_tx": 0, "fa_succ_tx": 0, "total_tx": 0, "succ_tx": 0,
-            "att_u": 0, "succ_u": 0, "refund_tx": 0, "refund_u": 0,
+            "att_u": 0, "succ_u": 0, "refund_tx": 0, "refund_u": 0, "net_u": 0,
             "elig_u": 0, "cancel_u": 0,
         })
         rx_acc["fa_u"] += int(r["first_attempt_users"])
@@ -1553,6 +1558,7 @@ def build_funnel_table(df: pd.DataFrame, brand_type: str, dims: list,
         rx_acc["succ_u"] += int(r["succ_users"])
         rx_acc["refund_tx"] += int(r["refund_tx"])
         rx_acc["refund_u"] += int(r["refund_users"])
+        rx_acc["net_u"] += int(r["net_users"])
         rx_acc["elig_u"] += int(r["tbb_elig_users"])
         rx_acc["cancel_u"] += int(r["tbb_cancel_users"])
         rx_acc["tbb"] = max(rx_acc["elig_u"] - rx_acc["cancel_u"], 0)
@@ -1591,8 +1597,10 @@ def build_funnel_table(df: pd.DataFrame, brand_type: str, dims: list,
          [fmt_pct(g0(g, "r0_succeeded") - gr(g, "1", "succ_u"), g0(g, "r0_succeeded")) for g in groups])
     push("# Refund R1", [fmt_int(gr(g, "1", "refund_tx")) for g in groups])
     push("% Refund R1", [fmt_pct(gr(g, "1", "refund_tx"), gr(g, "1", "succ_tx")) for g in groups])
+    # % Churn Net R0/R1 — Net STRICT : R1 net = succeeded ET ni refundé ni
+    # alerté (net_u). Aligné sur la def Notion / Exec Summary.
     push("% Churn Net R0/R1",
-         [fmt_pct(g0(g, "r0_succeeded") - (gr(g, "1", "succ_u") - gr(g, "1", "refund_u")),
+         [fmt_pct(g0(g, "r0_succeeded") - gr(g, "1", "net_u"),
                   g0(g, "r0_succeeded")) for g in groups])
 
     # R2 / R3 / R4 — show only if total eligible (across all groups) >= 10
@@ -1620,13 +1628,13 @@ def build_funnel_table(df: pd.DataFrame, brand_type: str, dims: list,
         push(f"# Refund {lbl}", [val_or(g, lambda g=g: fmt_int(gr(g, rx, "refund_tx"))) for g in groups])
         push(f"% Refund {lbl}", [val_or(g, lambda g=g: fmt_pct(gr(g, rx, "refund_tx"), gr(g, rx, "succ_tx"))) for g in groups])
         # % Churn Net Rn/Rm = (Rn_net - Rm_net) / Rn_net
-        # où Rk_net = succ_u_k - refund_u_k. AVANT (bug) : on divisait par Rn_brut
-        # ce qui faisait un mix brut/net et surestimait le churn de ~20 pts.
+        # où Rk_net = net_u (succeeded ET ni refundé ni alerté — Net STRICT,
+        # aligné Notion/Exec). AVANT : Rk_net = succ_u - refund_u (n'excluait
+        # pas is_alerted, et un bug antérieur divisait par Rn_brut).
         push(f"% Churn Net R{prev}/{lbl}",
              [val_or(g, lambda g=g: fmt_pct(
-                 (gr(g, prev, "succ_u") - gr(g, prev, "refund_u"))
-                   - (gr(g, rx, "succ_u") - gr(g, rx, "refund_u")),
-                 gr(g, prev, "succ_u") - gr(g, prev, "refund_u"))) for g in groups])
+                 gr(g, prev, "net_u") - gr(g, rx, "net_u"),
+                 gr(g, prev, "net_u"))) for g in groups])
 
     # =====================================================================
     # LTV Simulator (Booking only) — adds 4 lines at the bottom
@@ -2170,7 +2178,7 @@ def funnel_graph_data(
             "fa_u": 0, "fa_tx": 0, "fa_succ_tx": 0,
             "total_tx": 0, "succ_tx": 0,
             "att_u": 0, "succ_u": 0,
-            "refund_tx": 0, "refund_u": 0,
+            "refund_tx": 0, "refund_u": 0, "net_u": 0,
             "elig_u": 0, "cancel_u": 0,
         })
         acc["fa_u"] += int(r["first_attempt_users"])
@@ -2182,6 +2190,7 @@ def funnel_graph_data(
         acc["succ_u"] += int(r["succ_users"])
         acc["refund_tx"] += int(r["refund_tx"])
         acc["refund_u"] += int(r["refund_users"])
+        acc["net_u"] += int(r["net_users"])
         acc["elig_u"] += int(r["tbb_elig_users"])
         acc["cancel_u"] += int(r["tbb_cancel_users"])
         acc["tbb"] = max(acc["elig_u"] - acc["cancel_u"], 0)
@@ -2222,7 +2231,7 @@ def funnel_graph_data(
             "# Refund R1":                  gr("1", "refund_tx"),
             "% Refund R1":                  _ratio(gr("1", "refund_tx"), gr("1", "succ_tx")),
             "% Churn Net R0/R1":            _ratio(
-                g0("r0_succeeded") - (gr("1", "succ_u") - gr("1", "refund_u")),
+                g0("r0_succeeded") - gr("1", "net_u"),
                 g0("r0_succeeded")),
         }
         # R2 / R3 / R4 — same formulas as in build_funnel_table.
@@ -2244,10 +2253,10 @@ def funnel_graph_data(
             kpis[f"# Refund {lbl}"]                = gr(rx, "refund_tx")
             kpis[f"% Refund {lbl}"]                = _ratio(gr(rx, "refund_tx"), gr(rx, "succ_tx"))
             # % Churn Net Rn/Rm = (Rn_net - Rm_net) / Rn_net
-            # où Rk_net = succ_u_k - refund_u_k. AVANT (bug) : on divisait par
-            # Rn_brut — surestimait le churn ~20 pts.
-            _prev_net = gr(prev, "succ_u") - gr(prev, "refund_u")
-            _rx_net   = gr(rx,   "succ_u") - gr(rx,   "refund_u")
+            # où Rk_net = net_u (succeeded ET ni refundé ni alerté — Net STRICT,
+            # aligné Notion/Exec).
+            _prev_net = gr(prev, "net_u")
+            _rx_net   = gr(rx,   "net_u")
             kpis[f"% Churn Net R{prev}/{lbl}"]     = _ratio(_prev_net - _rx_net, _prev_net)
 
         # LTV Simulator — Booking only, requires curve_dim = price_booking
@@ -2837,12 +2846,15 @@ def exec_summary_sql(period_start: date, period_end: date) -> str:
       - % Refund          = refund_rev / brut             (CA-based, dates differentiated)
       - % VAMP Ratio      = alerts_visa / tx_succ_visa    (VISA only — VAMP = Visa Acquirer Monitoring Program)
 
-    IMPORTANT — Churn cohort definition (≠ TBB) :
-      The cohort used as denominator for the % Churn R0→R1 INCLUDES customers
-      who cancelled during their trial. They ARE real churners (they signed up
-      and didn't convert to a billed R1) — so excluding them would
-      under-estimate churn. The only restriction is "had time to reach R1",
-      enforced by `ms_trial_end ∈ window` (trial ended within the window).
+    IMPORTANT — Churn cohort definition (≠ TBB), ALIGNÉE SUR LE FUNNEL :
+      Le dénominateur du % Churn R0→R1 est la cohorte d'ACQUISITION (signup,
+      ms_date), niveau CUSTOMER (customer_id), Booking only — même logique que
+      r0_succeeded du funnel. Il INCLUT les cancelled-during-trial (= vrais
+      churners). GARDE-FOU de maturité : on ne garde que les customers dont
+      l'issue R0→R1 est tranchée — trial terminé (ms_trial_end <= aujourd'hui)
+      OU déjà cancellé. Les customers encore en trial actif sont exclus pour
+      ne pas surestimer le churn du mois en cours (inscrits de fin de période
+      qui n'ont pas encore pu atteindre R1).
 
       This is DIFFERENT from the funnel table's "# R1 To Be Billed" (TBB),
       which is an audit metric (\"who SHOULD have been billed by now?\") and
@@ -2850,7 +2862,7 @@ def exec_summary_sql(period_start: date, period_end: date) -> str:
 
     Date semantics:
       - r0                : by ms_date (signup date)
-      - churn_cohort_size : by ms_trial_end (cohort that should have reached R1 by now)
+      - churn_cohort_size : by ms_date (signup), garde-fou trial terminé/cancellé
       - brut              : by t_date (transaction date) for status='succeeded' tx (all cards)
       - refund_rev        : by refunded_at_utc (refund date), independent of t_date (all cards)
       - tx_succ_visa      : by t_date (transaction date), VISA + DELTA only
@@ -2901,6 +2913,7 @@ fm_in_window AS (
     fm.membership_id,
     fm.customer_id,
     fm.brand_type,
+    fm.ms_status,
     fm.ms_date,
     fm.ms_trial_end,
     fm.ms_default_psp AS psp,
@@ -2930,25 +2943,35 @@ r0 AS (
   GROUP BY 1, 2, 3
 ),
 churn_cohort AS (
-  -- Cohort for % Churn R0→R1 net : ALL Booking memberships whose TrialEnd
-  -- falls in s1/s2 (= had a chance to reach R1). INCLUDES customers who
-  -- cancelled during the trial — they ARE real churners.
+  -- % Churn R0→R1 (Booking) — ALIGNÉ SUR LE FUNNEL.
+  -- Dénominateur = CUSTOMERS (customer_id) dont le SIGNUP (ms_date) tombe
+  -- dans s1/s2 — même cohorte d'acquisition que le funnel, niveau customer.
+  --   * BOOKING ONLY (conversion du sub Booking, trial → billed R1).
+  --   * Exclut paused/abandonned/processing (comme r0_succeeded du funnel).
+  --   * INCLUT les cancelled-during-trial (= vrais churners).
+  --   * GARDE-FOU maturité : on ne garde que les customers dont l'issue
+  --     R0→R1 est tranchée — trial terminé (ms_trial_end <= aujourd'hui) OU
+  --     déjà cancellé. Les customers encore en trial actif (issue non
+  --     tranchée) sont exclus, sinon le churn du mois en cours serait
+  --     surestimé par les inscrits de fin de période.
   --
-  -- Distinct from the funnel table's "# R1 To Be Billed" (TBB), which is
-  -- an audit metric ("who should we have billed?") and legitimately
-  -- excludes cancelled-during-trial. The two cohorts serve different
-  -- purposes — see exec_summary_sql docstring.
-  --
-  -- BOOKING ONLY — we measure conversion of the Booking sub from trial
-  -- to billed. Magazine cross-sells have their own dynamic.
-  SELECT fm.conciergerie, fm.psp,
-    CASE
-      WHEN fm.ms_trial_end BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
-      WHEN fm.ms_trial_end BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s2_end FROM weeks_def) THEN 's2'
-    END AS bucket,
-    fm.membership_id,
+  -- Distinct du "# R1 To Be Billed" (TBB) du funnel, mesure d'audit billing
+  -- qui exclut, elle, les cancelled-during-trial. Ne pas confondre.
+  SELECT conciergerie, psp, bucket, customer_id,
     MAX(IF(r1.membership_id IS NOT NULL, 1, 0)) AS has_r1_net
-  FROM fm_in_window fm
+  FROM (
+    SELECT fm.conciergerie, fm.psp, fm.customer_id, fm.membership_id,
+      CASE
+        WHEN fm.ms_date BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
+        WHEN fm.ms_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s2_end FROM weeks_def) THEN 's2'
+      END AS bucket
+    FROM fm_in_window fm
+    WHERE fm.conciergerie IS NOT NULL
+      AND fm.brand_type = 'Booking'
+      AND fm.ms_status NOT IN ('abandonned', 'processing', 'paused')
+      AND fm.ms_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
+      AND (fm.ms_trial_end <= CURRENT_DATE() OR fm.cancelled_during_trial = TRUE)
+  ) fmb
   LEFT JOIN (
     SELECT DISTINCT membership_id
     FROM `eu-andy-marketing-raw.dashboard.fact_transactions`
@@ -2957,15 +2980,11 @@ churn_cohort AS (
       AND is_refunded = FALSE
       AND is_alerted = FALSE
       AND brand_type = 'Booking'
-  ) r1 ON r1.membership_id = fm.membership_id
-  WHERE fm.conciergerie IS NOT NULL
-    AND fm.brand_type = 'Booking'
-    AND fm.ms_trial_end BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
-    -- NB : NO `NOT cancelled_during_trial` filter — cancelled-during-trial
-    -- customers ARE churners and must be in the denominator.
+  ) r1 ON r1.membership_id = fmb.membership_id
   GROUP BY 1, 2, 3, 4
 ),
 churn_agg AS (
+  -- COUNT(*) sur les lignes groupées par customer = nb de customers de la cohorte
   SELECT conciergerie, psp, bucket, 'churn_cohort_size' AS metric,
     CAST(COUNT(*) AS FLOAT64) AS value
   FROM churn_cohort GROUP BY 1, 2, 3
@@ -3288,7 +3307,8 @@ def render_exec_summary(df: pd.DataFrame, period_start: date, period_end: date) 
 
     # ---- Compute fns par cellule (existants) ------------------------------
     def churn_fn(c, p, b):
-        # Churn cohort = Booking memberships dont TrialEnd ∈ fenêtre.
+        # Churn cohort = customers Booking signés-up (ms_date) ∈ fenêtre,
+        # garde-fou maturité (trial terminé OU cancellé). Aligné funnel.
         # INCLUT les cancelled-during-trial (= vrais churners). PAS un TBB.
         cohort = m(c, p, b, "churn_cohort_size")
         r1     = m(c, p, b, "r1_net_count")
