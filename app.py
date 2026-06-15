@@ -4217,6 +4217,10 @@ _AB_CLIQ_PRODUCT_IDS = "'063a0977-511e-4a14-baaf-d02e60119d7f', '8e3dca5f-7f4d-4
 # Chaque cohorte : (psp_group, nom affiché, prédicat SQL sur fm/sm/pr).
 # fm = fact_memberships, sm = stg_memberships (Metadata JSON), pr = stg_prices.
 AB_COHORTS = [
+    ("TP",  "Référence",
+     "fm.ms_default_psp='trustpayment' "
+     "AND COALESCE(JSON_VALUE(sm.Metadata,'$.abPreAuth'),'')!='B' "
+     "AND COALESCE(JSON_VALUE(sm.Metadata,'$.dynamic_descriptor_tp'),'')!='B'"),
     ("TP",  "Preauth only",
      "fm.ms_default_psp='trustpayment' AND JSON_VALUE(sm.Metadata,'$.abPreAuth')='B' "
      "AND COALESCE(JSON_VALUE(sm.Metadata,'$.dynamic_descriptor_tp'),'')!='B'"),
@@ -4226,6 +4230,10 @@ AB_COHORTS = [
     ("TP",  "Preauth + DD",
      "fm.ms_default_psp='trustpayment' AND JSON_VALUE(sm.Metadata,'$.abPreAuth')='B' "
      "AND JSON_VALUE(sm.Metadata,'$.dynamic_descriptor_tp')='B'"),
+    ("NMI", "Référence",
+     "fm.ms_default_psp='nmi' "
+     "AND COALESCE(JSON_VALUE(sm.Metadata,'$.abPreAuth'),'')!='B' "
+     f"AND COALESCE(CAST(pr.ProductId AS STRING),'') NOT IN ({_AB_CLIQ_PRODUCT_IDS})"),
     ("NMI", "Cliq",
      f"fm.ms_default_psp='nmi' AND CAST(pr.ProductId AS STRING) IN ({_AB_CLIQ_PRODUCT_IDS})"),
     ("NMI", "Preauth NMI",
