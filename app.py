@@ -964,8 +964,14 @@ def customer_price_join(alias: str, dims: list) -> str:
 # ---------------------------------------------------------------------------
 # Funnel query (one per brand_type) — supports dynamic dimensions
 # ---------------------------------------------------------------------------
-def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date] = None) -> str:
-    granularity = date_dim_key(dims) or "date_week"
+def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date] = None,
+               granularity_override: str = None, cohort_pool_sql: str = None) -> str:
+    # granularity_override : force la granularité de cohorte (ex. 'date_day' pour
+    #   l'onglet Analyse A/B) au lieu de la déduire des dims.
+    # cohort_pool_sql : subquery renvoyant une colonne `customer_id`. Si fournie,
+    #   on restreint bm/bt à ces customers (INNER JOIN) — sert à définir une
+    #   cohorte A/B custom (psp/productId/metadata) sans la coder en filtre.
+    granularity = granularity_override or date_dim_key(dims) or "date_week"
     trunc_arg = _DATE_DIM_TRUNC[granularity]
     weeks_cte = weeks_cte_sql(weeks_list, granularity) if weeks_list is not None else WEEKS_CTE
     is_booking = brand_type == "Booking"
@@ -990,6 +996,15 @@ def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date
     cp_join_ft = customer_pool_join("ft", filters)
     cp_price_cte = customer_price_cte(dims)
     cp_price_join_fm = customer_price_join("fm", dims)
+    # Cohorte A/B : INNER JOIN sur la whitelist de customers (si fournie).
+    cohort_join_fm = (
+        f"  INNER JOIN (\n{cohort_pool_sql}\n  ) cohort_pool ON cohort_pool.customer_id = fm.customer_id"
+        if cohort_pool_sql else ""
+    )
+    cohort_join_ft = (
+        f"  INNER JOIN (\n{cohort_pool_sql}\n  ) cohort_pool ON cohort_pool.customer_id = ft.customer_id"
+        if cohort_pool_sql else ""
+    )
     # Row-level filters (PSP / Verticale / Conciergerie / Devise / Marché Booking)
     # — applied directly in WHERE of bm and bt so non-matching rows are excluded.
     fm_filter = row_level_filter_clause("fm", filters)
@@ -1037,6 +1052,7 @@ bm AS (
     ON CAST(fm.membership_id AS STRING) = CAST(sm.Id AS STRING)
   {cp_join_fm}
   {cp_price_join_fm}
+{cohort_join_fm}
   CROSS JOIN window_bounds wb
   WHERE DATE(c.CreatedAtUtc) BETWEEN wb.ws_min AND wb.ws_max
     AND DATE_TRUNC(DATE(c.CreatedAtUtc), {trunc_arg}) IN (SELECT week_start FROM weeks)
@@ -1074,6 +1090,7 @@ bt AS (
   FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
   JOIN `eu-andy-marketing-raw.silver_sgw.stg_customers` c ON ft.customer_id = c.Id
   {cp_join_ft}
+{cohort_join_ft}
   CROSS JOIN window_bounds wb
   WHERE DATE(c.CreatedAtUtc) BETWEEN wb.ws_min AND wb.ws_max
     AND ft.t_date BETWEEN wb.ws_min AND CURRENT_DATE()
@@ -4179,9 +4196,152 @@ header_html = f"""
 """
 st.markdown(header_html, unsafe_allow_html=True)
 
+# ===========================================================================
+# Onglet ANALYSE A/B — cohortes figées (indépendant de la sidebar)
+# ===========================================================================
+# Onglet "mouvant" : on fige des cohortes A/B précises (fenêtre de signup +
+# conditions psp/productId/metadata) et on affiche, par PSP, le MÊME funnel
+# (KPI R0→R4 identiques aux onglets Funnel) pour chaque cohorte, en colonnes
+# Booking + Magazine. Réutilise funnel_sql + build_funnel_table (mêmes calculs).
+#
+# Pour éditer l'analyse : modifier AB_WINDOW + AB_COHORTS ci-dessous, puis push.
+AB_WINDOW_START = date(2026, 6, 8)   # createdAt membership >= (signup)
+AB_WINDOW_END   = date(2026, 6, 10)  # createdAt membership <=
+_AB_CLIQ_PRODUCT_IDS = "'063a0977-511e-4a14-baaf-d02e60119d7f', '8e3dca5f-7f4d-4ada-b472-b8e5dcae0565'"
+
+# Chaque cohorte : (psp_group, nom affiché, prédicat SQL sur fm/sm/pr).
+# fm = fact_memberships, sm = stg_memberships (Metadata JSON), pr = stg_prices.
+AB_COHORTS = [
+    ("TP",  "Preauth only",
+     "fm.ms_default_psp='trustpayment' AND JSON_VALUE(sm.Metadata,'$.abPreAuth')='B' "
+     "AND COALESCE(JSON_VALUE(sm.Metadata,'$.dynamic_descriptor_tp'),'')!='B'"),
+    ("TP",  "DD only",
+     "fm.ms_default_psp='trustpayment' AND JSON_VALUE(sm.Metadata,'$.dynamic_descriptor_tp')='B' "
+     "AND COALESCE(JSON_VALUE(sm.Metadata,'$.abPreAuth'),'')!='B'"),
+    ("TP",  "Preauth + DD",
+     "fm.ms_default_psp='trustpayment' AND JSON_VALUE(sm.Metadata,'$.abPreAuth')='B' "
+     "AND JSON_VALUE(sm.Metadata,'$.dynamic_descriptor_tp')='B'"),
+    ("NMI", "Cliq",
+     f"fm.ms_default_psp='nmi' AND CAST(pr.ProductId AS STRING) IN ({_AB_CLIQ_PRODUCT_IDS})"),
+    ("NMI", "Preauth NMI",
+     "fm.ms_default_psp='nmi' AND JSON_VALUE(sm.Metadata,'$.abPreAuth')='B' "
+     f"AND COALESCE(CAST(pr.ProductId AS STRING),'') NOT IN ({_AB_CLIQ_PRODUCT_IDS})"),
+    ("LBP", "LBP only",
+     "fm.ms_default_psp='labanquepostale' AND COALESCE(JSON_VALUE(sm.Metadata,'$.abPreAuth'),'')!='B'"),
+    ("LBP", "Preauth LBP",
+     "fm.ms_default_psp='labanquepostale' AND JSON_VALUE(sm.Metadata,'$.abPreAuth')='B'"),
+]
+AB_PSP_ORDER = ["TP", "NMI", "LBP"]
+AB_PSP_LABELS = {"TP": "TrustPayment", "NMI": "NMI", "LBP": "La Banque Postale"}
+
+
+def _ab_pool_sql(predicate: str) -> str:
+    """Subquery renvoyant les customer_id de la cohorte (membership Booking
+    matchant le prédicat, signup dans la fenêtre). Injecté dans funnel_sql."""
+    return (
+        "    SELECT DISTINCT fm.customer_id\n"
+        "    FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm\n"
+        "    JOIN `eu-andy-marketing-raw.silver_sgw.stg_memberships` sm\n"
+        "      ON CAST(fm.membership_id AS STRING) = CAST(sm.Id AS STRING)\n"
+        "    LEFT JOIN `eu-andy-marketing-raw.silver_sgw.stg_prices` pr\n"
+        "      ON CAST(fm.price_id AS STRING) = CAST(pr.Id AS STRING)\n"
+        f"    WHERE DATE(sm.CreatedAtUtc) BETWEEN '{AB_WINDOW_START.isoformat()}' AND '{AB_WINDOW_END.isoformat()}'\n"
+        "      AND fm.brand_type = 'Booking'\n"
+        f"      AND ({predicate})"
+    )
+
+
+# Fenêtre de cohorte côté funnel : jours de la fenêtre signup ± 1 jour de marge
+# (couvre l'écart de minuit entre customer.CreatedAtUtc et membership.CreatedAtUtc).
+# Le pool customer définit la vraie cohorte ; dims=[] => tout agrégé en UNE colonne.
+_AB_WEEKS = periods_in_range(
+    date.fromordinal(AB_WINDOW_START.toordinal() - 1),
+    date.fromordinal(AB_WINDOW_END.toordinal() + 1),
+    "date_day",
+)
+
+
+def ab_maturity_sql() -> str:
+    """Par cohorte : jours écoulés entre la veille minuit et le dernier R0 créé
+    (= dernier signup Booking de la cohorte), + nb de users. Sert à savoir quels
+    R sont analysables."""
+    parts = []
+    for psp, name, pred in AB_COHORTS:
+        parts.append(
+            f"SELECT '{psp}' AS psp, '{name}' AS cohort,\n"
+            "  DATE_DIFF(DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY), DATE(MAX(sm.CreatedAtUtc)), DAY) AS days_elapsed,\n"
+            "  DATE(MAX(sm.CreatedAtUtc)) AS last_r0,\n"
+            "  COUNT(DISTINCT fm.customer_id) AS users\n"
+            "FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm\n"
+            "JOIN `eu-andy-marketing-raw.silver_sgw.stg_memberships` sm\n"
+            "  ON CAST(fm.membership_id AS STRING) = CAST(sm.Id AS STRING)\n"
+            "LEFT JOIN `eu-andy-marketing-raw.silver_sgw.stg_prices` pr\n"
+            "  ON CAST(fm.price_id AS STRING) = CAST(pr.Id AS STRING)\n"
+            f"WHERE DATE(sm.CreatedAtUtc) BETWEEN '{AB_WINDOW_START.isoformat()}' AND '{AB_WINDOW_END.isoformat()}'\n"
+            f"  AND fm.brand_type='Booking' AND ({pred})"
+        )
+    return "\nUNION ALL\n".join(parts)
+
+
+def build_ab_psp_table(psp_group: str) -> pd.DataFrame:
+    """Construit la table combinée d'un PSP : lignes = KPI funnel R0→R4,
+    colonnes = (cohorte × {Booking, Magazine}). Réutilise build_funnel_table
+    pour chaque (cohorte, brand) -> garantit des calculs identiques au funnel."""
+    cohorts = [(n, p) for (g, n, p) in AB_COHORTS if g == psp_group]
+    groups = [(name, brand) for (name, _pred) in cohorts for brand in ("Booking", "Magazine")]
+    col_dicts: dict = {}
+    for name, pred in cohorts:
+        pool = _ab_pool_sql(pred)
+        for brand in ("Booking", "Magazine"):
+            df = run_query(funnel_sql(brand, {}, [], _AB_WEEKS,
+                                      granularity_override="date_day", cohort_pool_sql=pool))
+            tbl = build_funnel_table(df, brand, [], picked_end=AB_WINDOW_END)
+            col_dicts[(name, brand)] = {
+                str(r["__key__"]): r.get(("Total",), "") for _, r in tbl.iterrows()
+            }
+
+    rows = []
+    for section_name, kpis in FUNNEL_KPI_SECTIONS:
+        if section_name == "LTV Simulator":
+            continue  # simulateur revenu, hors périmètre de l'analyse A/B
+        present = [k for k in kpis if any(k in col_dicts[g] for g in groups)]
+        if not present:
+            continue
+        rows.append({"__key__": "__SECTION__" + section_name, **{g: "" for g in groups}})
+        for k in present:
+            rows.append({"__key__": k, **{g: col_dicts[g].get(k, "—") for g in groups}})
+
+    out = pd.DataFrame(rows)
+    out.attrs["dims"] = [("cohort", "Cohorte", "", ""), ("brand", "Abo", "", "")]
+    out.attrs["groups"] = groups
+    return out
+
+
+def render_ab_maturity(df_mat: pd.DataFrame, psp_group: str) -> str:
+    """Petit bandeau de maturité au-dessus de chaque table PSP."""
+    sub = df_mat[df_mat["psp"] == psp_group]
+    if sub.empty:
+        return ""
+    cells = []
+    for _, r in sub.iterrows():
+        d = int(r["days_elapsed"]) if r["days_elapsed"] is not None else 0
+        cells.append(
+            f"<tr><td style='padding:2px 10px;'>{_esc(r['cohort'])}</td>"
+            f"<td style='padding:2px 10px;text-align:right;font-weight:600;'>{d} j</td>"
+            f"<td style='padding:2px 10px;text-align:right;color:#64748b;'>{int(r['users'])} users</td>"
+            f"<td style='padding:2px 10px;color:#64748b;'>dernier R0 : {_esc(r['last_r0'])}</td></tr>"
+        )
+    return (
+        "<div style='margin:6px 0 10px;font-size:13px;'>"
+        "<div style='color:#64748b;margin-bottom:4px;'>⏱️ Maturité (jours écoulés depuis le dernier R0 créé — "
+        "indique quels R sont analysables) :</div>"
+        "<table style='border-collapse:collapse;'>" + "".join(cells) + "</table></div>"
+    )
+
+
 # Tabs
-tab_exec, tab_billing, tab_b, tab_m, tab_vc, tab_vd = st.tabs(
-    ["Executive Summary", "Executive Summary Billing", "Funnel Booking", "Funnel Magazine", "VAMP Cohort", "VAMP Date"]
+tab_exec, tab_billing, tab_b, tab_m, tab_vc, tab_vd, tab_ab = st.tabs(
+    ["Executive Summary", "Executive Summary Billing", "Funnel Booking", "Funnel Magazine", "VAMP Cohort", "VAMP Date", "Analyse A/B"]
 )
 
 with tab_exec:
@@ -4286,3 +4446,25 @@ with tab_vd:
     # Graph section under the table
     st.divider()
     render_vamp_graph("date", filters, _picked_start, _picked_end, key_prefix="vamp_date")
+
+with tab_ab:
+    st.caption(
+        f"Analyse A/B — cohortes figées (signup {AB_WINDOW_START.strftime('%d/%m')} → "
+        f"{AB_WINDOW_END.strftime('%d/%m/%Y')}). Indépendant de la sidebar. "
+        "Mêmes KPI que les funnels, par cohorte × Booking/Magazine."
+    )
+    with st.spinner("Analyse A/B…"):
+        try:
+            df_mat = run_query(ab_maturity_sql())
+        except Exception as e:
+            st.error(f"Erreur maturité A/B : {e}")
+            df_mat = pd.DataFrame(columns=["psp", "cohort", "days_elapsed", "last_r0", "users"])
+        for _psp in AB_PSP_ORDER:
+            st.subheader(AB_PSP_LABELS.get(_psp, _psp))
+            st.markdown(render_ab_maturity(df_mat, _psp), unsafe_allow_html=True)
+            try:
+                _ab_tbl = build_ab_psp_table(_psp)
+                st.markdown(render_table_html(_ab_tbl), unsafe_allow_html=True)
+            except Exception as e:
+                st.error(f"Erreur table A/B {_psp} : {e}")
+            st.divider()
