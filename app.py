@@ -4080,107 +4080,111 @@ def render_exec_billing(df: pd.DataFrame,
 st.title("📊 Weekly PSP Report")
 st.caption("Funnel + VAMP — basé sur le skill `weekly-psp-report` (v3) — dimensions dynamiques.")
 
-# Sidebar: date range
-st.sidebar.header("Période")
+# Sidebar: navigation (Option A) — une seule page exécute ses requêtes à la
+# fois. Avant (st.tabs), le contenu des 7 onglets s'exécutait à CHAQUE
+# interaction. Ici on ne charge que la page regardée, et les contrôles funnel
+# (dates/dims/filtres) seulement si la page en a besoin.
+st.sidebar.header("Page")
+_PAGES = ["Executive Summary", "Executive Summary Billing", "Funnel Booking",
+          "Funnel Magazine", "VAMP Cohort", "VAMP Date", "Analyse A/B"]
+page = st.sidebar.radio("Aller à", _PAGES, index=0, key="page_nav",
+                        label_visibility="collapsed")
+st.sidebar.divider()
+
+# Pages qui ont besoin des contrôles funnel (dates / dimensions / filtres).
+_FUNNEL_PAGES = {"Funnel Booking", "Funnel Magazine", "VAMP Cohort", "VAMP Date"}
+_needs_controls = page in _FUNNEL_PAGES
+
+# Defaults (utilisés quand la page n'utilise pas la sidebar funnel)
 _today = date.today()
-_default_end = _today - timedelta(days=_today.weekday() + 1)  # last Sunday
-_default_start = _default_end - timedelta(days=10 * 7 - 1)    # 10 weeks before
-_date_range = st.sidebar.date_input(
-    "Plage de cohortes",
-    value=(_default_start, _default_end),
-    min_value=_today - timedelta(days=365 * 2),
-    max_value=_today,
-    help="Les semaines complètes (lundi → dimanche) qui intersectent la plage.",
-    key="date_range",
-)
-if isinstance(_date_range, tuple) and len(_date_range) == 2:
-    _start_d, _end_d = _date_range
-else:
-    _start_d, _end_d = _default_start, _default_end
-_picked_start, _picked_end = _start_d, _end_d  # remembered for use after dim picker
-
-st.sidebar.divider()
-
-# Sidebar: dimensions (column-axis splits) — two independent dropdowns.
-st.sidebar.header("Dimensions")
-_NONE_LABEL = "— aucune —"
-_all_dim_labels = [d[1] for d in DIMENSION_DIMS]
-_dim_options = [_NONE_LABEL] + _all_dim_labels
-
-dim1_label = st.sidebar.selectbox(
-    "Dimension 1 (extérieure)",
-    options=_dim_options,
-    index=_dim_options.index("Date (semaine)"),
-    help="Niveau extérieur du split de colonnes.",
-    key="dim1_selector",
-)
-dim2_label = st.sidebar.selectbox(
-    "Dimension 2 (intérieure)",
-    options=_dim_options,
-    index=0,
-    help="Niveau intérieur du split. Choisis « aucune » pour ne pas empiler.",
-    key="dim2_selector",
-)
-
-selected_dim_labels = []
-if dim1_label != _NONE_LABEL:
-    selected_dim_labels.append(dim1_label)
-if dim2_label != _NONE_LABEL and dim2_label != dim1_label:
-    selected_dim_labels.append(dim2_label)
-
-dims = selected_dims(selected_dim_labels)
-# Mutually-exclusive date granularities — keep only the first date dim.
-_seen_date = False
-_dims_filtered = []
-for d in dims:
-    if d[0] in _DATE_DIM_KEYS:
-        if _seen_date:
-            continue
-        _seen_date = True
-    _dims_filtered.append(d)
-dims = _dims_filtered
-
-# Now compute the periods list using the granularity that the user picked.
-_granularity = date_dim_key(dims) or "date_week"
-weeks_list = periods_in_range(_picked_start, _picked_end, _granularity)
-_period_word = {"date_day": "jour", "date_week": "semaine", "date_month": "mois"}[_granularity]
-st.sidebar.caption(f"{len(weeks_list)} {_period_word}{'s' if len(weeks_list) > 1 else ''} sélectionné{'s' if len(weeks_list) > 1 else ''}")
-
-st.sidebar.divider()
-
-# Sidebar: filters
-# Filter options are scoped to the user-selected date range so the dropdown
-# proposes exactly the values that exist in the data the user is looking at.
-st.sidebar.header("Filtres")
-with st.spinner("Chargement des options de filtre…"):
-    try:
-        opts_df = run_query(filter_options_sql(_picked_start, _picked_end))
-    except Exception as e:
-        st.sidebar.error(f"Échec chargement filtres : {e}")
-        opts_df = pd.DataFrame(columns=["dim", "val", "n"])
-
+_default_end = _today - timedelta(days=_today.weekday() + 1)   # dernier dimanche
+_default_start = _default_end - timedelta(days=10 * 7 - 1)     # 10 semaines avant
+_picked_start, _picked_end = _default_start, _default_end
+dims: list = []
 filters: dict = {}
-for key, label, _fm, _ft in FILTER_DIMS:
-    dim_opts = opts_df[opts_df["dim"] == key].sort_values("n", ascending=False)
-    choices = [v if v != "" else "(empty)" for v in dim_opts["val"].tolist()]
-    counts = {v if v != "" else "(empty)": int(n) for v, n in zip(dim_opts["val"], dim_opts["n"])}
-    selected = st.sidebar.multiselect(
-        label,
-        options=choices,
-        default=[],
-        format_func=lambda v, _c=counts: f"{v} ({_c.get(v, 0):,})".replace(",", " "),
-        key=f"filter_{key}",
-    )
-    if selected:
-        filters[key] = selected
+weeks_list = None
 
-# Cache controls
+if _needs_controls:
+    # Sidebar: date range
+    st.sidebar.header("Période")
+    _date_range = st.sidebar.date_input(
+        "Plage de cohortes",
+        value=(_default_start, _default_end),
+        min_value=_today - timedelta(days=365 * 2),
+        max_value=_today,
+        help="Les semaines complètes (lundi → dimanche) qui intersectent la plage.",
+        key="date_range",
+    )
+    if isinstance(_date_range, tuple) and len(_date_range) == 2:
+        _picked_start, _picked_end = _date_range
+
+    st.sidebar.divider()
+
+    # Sidebar: dimensions (column-axis splits) — two independent dropdowns.
+    st.sidebar.header("Dimensions")
+    _NONE_LABEL = "— aucune —"
+    _dim_options = [_NONE_LABEL] + [d[1] for d in DIMENSION_DIMS]
+    dim1_label = st.sidebar.selectbox(
+        "Dimension 1 (extérieure)", options=_dim_options,
+        index=_dim_options.index("Date (semaine)"),
+        help="Niveau extérieur du split de colonnes.", key="dim1_selector",
+    )
+    dim2_label = st.sidebar.selectbox(
+        "Dimension 2 (intérieure)", options=_dim_options, index=0,
+        help="Niveau intérieur du split. Choisis « aucune » pour ne pas empiler.",
+        key="dim2_selector",
+    )
+    selected_dim_labels = []
+    if dim1_label != _NONE_LABEL:
+        selected_dim_labels.append(dim1_label)
+    if dim2_label != _NONE_LABEL and dim2_label != dim1_label:
+        selected_dim_labels.append(dim2_label)
+    dims = selected_dims(selected_dim_labels)
+    # Mutually-exclusive date granularities — keep only the first date dim.
+    _seen_date = False
+    _dims_filtered = []
+    for d in dims:
+        if d[0] in _DATE_DIM_KEYS:
+            if _seen_date:
+                continue
+            _seen_date = True
+        _dims_filtered.append(d)
+    dims = _dims_filtered
+
+    _granularity = date_dim_key(dims) or "date_week"
+    weeks_list = periods_in_range(_picked_start, _picked_end, _granularity)
+    _period_word = {"date_day": "jour", "date_week": "semaine", "date_month": "mois"}[_granularity]
+    st.sidebar.caption(f"{len(weeks_list)} {_period_word}{'s' if len(weeks_list) > 1 else ''} sélectionné{'s' if len(weeks_list) > 1 else ''}")
+
+    st.sidebar.divider()
+
+    # Sidebar: filters (scoped to the selected date range)
+    st.sidebar.header("Filtres")
+    with st.spinner("Chargement des options de filtre…"):
+        try:
+            opts_df = run_query(filter_options_sql(_picked_start, _picked_end))
+        except Exception as e:
+            st.sidebar.error(f"Échec chargement filtres : {e}")
+            opts_df = pd.DataFrame(columns=["dim", "val", "n"])
+    for key, label, _fm, _ft in FILTER_DIMS:
+        dim_opts = opts_df[opts_df["dim"] == key].sort_values("n", ascending=False)
+        choices = [v if v != "" else "(empty)" for v in dim_opts["val"].tolist()]
+        counts = {v if v != "" else "(empty)": int(n) for v, n in zip(dim_opts["val"], dim_opts["n"])}
+        selected = st.sidebar.multiselect(
+            label, options=choices, default=[],
+            format_func=lambda v, _c=counts: f"{v} ({_c.get(v, 0):,})".replace(",", " "),
+            key=f"filter_{key}",
+        )
+        if selected:
+            filters[key] = selected
+
+# Cache controls (toujours visibles)
 st.sidebar.divider()
 col_a, col_b = st.sidebar.columns(2)
 if col_a.button("🔄 Rafraîchir", use_container_width=True, help="Vide le cache et recharge"):
     st.cache_data.clear()
     st.rerun()
-col_b.caption(f"TTL cache: 24h")
+col_b.caption("TTL cache: 24h")
 
 # Header / meta line
 active_filters = ", ".join(f"{label} ({len(filters[key])})" for key, label, _, _ in FILTER_DIMS if key in filters)
@@ -4194,7 +4198,8 @@ header_html = f"""
   {(' · <b>Filtres actifs:</b> ' + active_filters) if active_filters else ''}
 </div>
 """
-st.markdown(header_html, unsafe_allow_html=True)
+if _needs_controls:
+    st.markdown(header_html, unsafe_allow_html=True)
 
 # ===========================================================================
 # Onglet ANALYSE A/B — cohortes figées (indépendant de la sidebar)
@@ -4340,11 +4345,7 @@ def render_ab_maturity(df_mat: pd.DataFrame, psp_group: str) -> str:
 
 
 # Tabs
-tab_exec, tab_billing, tab_b, tab_m, tab_vc, tab_vd, tab_ab = st.tabs(
-    ["Executive Summary", "Executive Summary Billing", "Funnel Booking", "Funnel Magazine", "VAMP Cohort", "VAMP Date", "Analyse A/B"]
-)
-
-with tab_exec:
+if page == "Executive Summary":
     # Indépendant de la sidebar : a son propre sélecteur de mois (MTD courant
     # + 11 mois précédents complets). Compare auto à M-1 équivalent.
     _exec_months = _months_for_exec_selector(12)
@@ -4370,7 +4371,7 @@ with tab_exec:
         except Exception as e:
             st.error(f"Erreur Executive Summary : {e}")
 
-with tab_billing:
+elif page == "Executive Summary Billing":
     # Indépendant de la sidebar : son propre sélecteur de semaine (WTD courant
     # + 11 semaines précédentes complètes). Comparaison vs S-1.
     _billing_weeks = _weeks_for_billing_selector(12)
@@ -4397,7 +4398,7 @@ with tab_billing:
         except Exception as e:
             st.error(f"Erreur Executive Summary Billing : {e}")
 
-with tab_b:
+elif page == "Funnel Booking":
     with st.spinner("Funnel Booking…"):
         try:
             df = run_query(funnel_sql("Booking", filters, dims, weeks_list))
@@ -4410,7 +4411,7 @@ with tab_b:
     st.divider()
     render_funnel_graph("Booking", filters, _picked_start, _picked_end, key_prefix="booking")
 
-with tab_m:
+elif page == "Funnel Magazine":
     with st.spinner("Funnel Magazine…"):
         try:
             df = run_query(funnel_sql("Magazine", filters, dims, weeks_list))
@@ -4423,7 +4424,7 @@ with tab_m:
     st.divider()
     render_funnel_graph("Magazine", filters, _picked_start, _picked_end, key_prefix="magazine")
 
-with tab_vc:
+elif page == "VAMP Cohort":
     with st.spinner("VAMP Cohort…"):
         try:
             df = run_query(vamp_cohort_sql(filters, dims, weeks_list))
@@ -4435,7 +4436,7 @@ with tab_vc:
     st.divider()
     render_vamp_graph("cohort", filters, _picked_start, _picked_end, key_prefix="vamp_cohort")
 
-with tab_vd:
+elif page == "VAMP Date":
     with st.spinner("VAMP Date…"):
         try:
             df = run_query(vamp_date_sql(filters, dims, weeks_list))
@@ -4447,7 +4448,7 @@ with tab_vd:
     st.divider()
     render_vamp_graph("date", filters, _picked_start, _picked_end, key_prefix="vamp_date")
 
-with tab_ab:
+elif page == "Analyse A/B":
     st.caption(
         f"Analyse A/B — cohortes figées (signup {AB_WINDOW_START.strftime('%d/%m')} → "
         f"{AB_WINDOW_END.strftime('%d/%m/%Y')}). Indépendant de la sidebar. "
