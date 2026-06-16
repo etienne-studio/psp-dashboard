@@ -4353,6 +4353,100 @@ def render_ab_maturity(df_mat: pd.DataFrame, psp_group: str) -> str:
 
 
 # Tabs
+def _ab_conc_case(alias: str) -> str:
+    return (
+        f"CASE LOWER(SPLIT(COALESCE({alias}.brand,''),' - ')[OFFSET(0)]) "
+        "WHEN 'reserv-go' THEN 'Reserv-Go' "
+        "WHEN 'book-ici' THEN 'Book-Ici' "
+        "WHEN 'resadexa' THEN 'Resadexa' ELSE 'autre' END"
+    )
+
+
+def ab_dd_tp_matrix_sql() -> str:
+    """Focus DD TP : matrice conciergerie Booking × magazine cross-brand sur la
+    cohorte DD TP (1 ligne par conciergerie Booking, comptes de users)."""
+    return f"""
+WITH cohort_bk AS (
+  SELECT DISTINCT fm.customer_id, {_ab_conc_case('fm')} AS booking_conc
+  FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm
+  JOIN `eu-andy-marketing-raw.silver_sgw.stg_memberships` sm
+    ON CAST(fm.membership_id AS STRING) = CAST(sm.Id AS STRING)
+  WHERE DATE(sm.CreatedAtUtc) BETWEEN '{AB_WINDOW_START.isoformat()}' AND '{AB_WINDOW_END.isoformat()}'
+    AND fm.brand_type='Booking' AND fm.ms_default_psp='trustpayment'
+    AND JSON_VALUE(sm.Metadata,'$.dynamic_descriptor_tp')='B'
+    AND COALESCE(JSON_VALUE(sm.Metadata,'$.abPreAuth'),'')!='B'
+    AND fm.ms_status NOT IN ('abandonned','processing','paused')
+),
+cohort_mag AS (
+  SELECT DISTINCT fm.customer_id, {_ab_conc_case('fm')} AS mag_conc
+  FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm
+  JOIN `eu-andy-marketing-raw.silver_sgw.stg_memberships` sm
+    ON CAST(fm.membership_id AS STRING) = CAST(sm.Id AS STRING)
+  WHERE DATE(sm.CreatedAtUtc) BETWEEN '{AB_WINDOW_START.isoformat()}' AND '{AB_WINDOW_END.isoformat()}'
+    AND fm.brand_type='Magazine' AND fm.ms_status NOT IN ('abandonned','processing','paused')
+    AND fm.customer_id IN (SELECT customer_id FROM cohort_bk)
+)
+SELECT b.booking_conc,
+  COUNT(DISTINCT b.customer_id) AS booking_users,
+  COUNT(DISTINCT IF(m.mag_conc='Reserv-Go', m.customer_id, NULL)) AS mag_reservgo,
+  COUNT(DISTINCT IF(m.mag_conc='Book-Ici',  m.customer_id, NULL)) AS mag_bookici,
+  COUNT(DISTINCT IF(m.mag_conc='Resadexa',  m.customer_id, NULL)) AS mag_resadexa
+FROM cohort_bk b
+LEFT JOIN cohort_mag m USING(customer_id)
+GROUP BY b.booking_conc
+"""
+
+
+def render_dd_tp_matrix(df: pd.DataFrame) -> str:
+    """Matrice conciergerie Booking (lignes) × magazine cross-brand (colonnes),
+    avec total mag par ligne et par colonne. Séparation Booking | mags."""
+    order = ["Reserv-Go", "Book-Ici", "Resadexa"]
+    mag_cols = [("Reserv-Go", "mag_reservgo"), ("Book-Ici", "mag_bookici"), ("Resadexa", "mag_resadexa")]
+    by = {str(r["booking_conc"]): r for _, r in df.iterrows()}
+    col_tot = {k: 0 for _, k in mag_cols}
+    grand = 0
+    cell = "padding:6px 14px;text-align:right;border-bottom:1px solid #e2e8f0;"
+    sep = "border-left:3px solid #334155;"
+    rows_html = ""
+    for conc in order:
+        r = by.get(conc)
+        bk = int(r["booking_users"]) if r is not None else 0
+        tds, rowtot = [], 0
+        for i, (_mlabel, k) in enumerate(mag_cols):
+            v = int(r[k]) if r is not None else 0
+            col_tot[k] += v
+            rowtot += v
+            disp = str(v) if v else "<span style='color:#cbd5e1;'>–</span>"
+            tds.append(f"<td style='{cell}{sep if i == 0 else ''}'>{disp}</td>")
+        grand += rowtot
+        rows_html += (
+            f"<tr><td style='{cell}text-align:left;font-weight:600;'>{_esc(conc)}</td>"
+            f"<td style='{cell}'>{bk}</td>" + "".join(tds)
+            + f"<td style='{cell}font-weight:700;'>{rowtot}</td></tr>"
+        )
+    tot_tds = "".join(
+        f"<td style='{cell}{sep if i == 0 else ''}font-weight:700;'>{col_tot[k]}</td>"
+        for i, (_, k) in enumerate(mag_cols)
+    )
+    rows_html += (
+        f"<tr style='background:#f1f5f9;'><td style='{cell}text-align:left;font-weight:700;'>Total mag</td>"
+        f"<td style='{cell}'></td>{tot_tds}"
+        f"<td style='{cell}font-weight:800;'>{grand}</td></tr>"
+    )
+    head = (
+        f"<th style='{cell}text-align:left;'>Conciergerie (Booking)</th>"
+        f"<th style='{cell}'>Booking</th>"
+        f"<th style='{cell}{sep}'>Mag Reserv-Go</th>"
+        f"<th style='{cell}'>Mag Book-Ici</th>"
+        f"<th style='{cell}'>Mag Resadexa</th>"
+        f"<th style='{cell}'>Total mag</th>"
+    )
+    return (
+        "<table style='border-collapse:collapse;font-size:13px;margin-top:6px;'>"
+        f"<thead><tr>{head}</tr></thead><tbody>{rows_html}</tbody></table>"
+    )
+
+
 if page == "Executive Summary":
     # Indépendant de la sidebar : a son propre sélecteur de mois (MTD courant
     # + 11 mois précédents complets). Compare auto à M-1 équivalent.
@@ -4477,3 +4571,17 @@ elif page == "Analyse A/B":
             except Exception as e:
                 st.error(f"Erreur table A/B {_psp} : {e}")
             st.divider()
+
+    # Focus DD TP — matrice cross-sell magazine cross-brand (conciergeries TP)
+    st.subheader("Focus — DD TP · magazine cross-brand")
+    st.caption(
+        "Cohorte DD TP (descripteur dynamique). Par conciergerie en Booking, "
+        "répartition des users sur le magazine d'une AUTRE conciergerie TP. "
+        "Attendu : Booking ≈ Total mag de la ligne."
+    )
+    with st.spinner("Focus DD TP…"):
+        try:
+            _dd = run_query(ab_dd_tp_matrix_sql())
+            st.markdown(render_dd_tp_matrix(_dd), unsafe_allow_html=True)
+        except Exception as e:
+            st.error(f"Erreur Focus DD TP : {e}")
