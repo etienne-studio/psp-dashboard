@@ -193,6 +193,7 @@ FILTER_DIMS = [
     # Expressions are rewired just below DIMENSION_DIMS (after they are defined).
     ("conciergerie",    "Conciergerie",    "PLACEHOLDER",        "PLACEHOLDER"),
     ("mid",             "MID",             "PLACEHOLDER",        "PLACEHOLDER"),
+    ("brand_psp",       "Conciergerie × PSP", "RAW:bpsp.brand_psp", "RAW:bpsp.brand_psp"),
     ("verticale",       "Verticale",       "sgw_verticale",      "sgw_verticale"),
     ("psp",             "PSP",             "ms_default_psp",     "ms_default_psp"),
     ("currency",        "Devise",          "ms_currency",        "ms_currency"),
@@ -504,6 +505,7 @@ DIMENSION_DIMS = [
     ("date_month",     "Date (mois)",             None,                          None),
     ("conciergerie",   "Conciergerie",            CONCIERGERIE_EXPR_FM,          CONCIERGERIE_EXPR_FT),
     ("mid",            "MID",                     MID_EXPR_FM,                   MID_EXPR_FT),
+    ("brand_psp",      "Conciergerie × PSP",      "RAW:bpsp.brand_psp",          "RAW:bpsp.brand_psp"),
     ("verticale",      "Verticale",               "sgw_verticale",               "sgw_verticale"),
     # Customer-level price buckets (cp_price CTE).
     # Same semantics as the "Prix Booking" / "Prix Magazine" FILTERS: each
@@ -861,7 +863,9 @@ def row_level_filter_clause(scope: str, filters: dict) -> str:
         if not vals:
             continue
         col_spec = fm_col if scope == "fm" else ft_col
-        if "{alias}" in col_spec:
+        if col_spec.startswith("RAW:"):
+            target = col_spec[4:]
+        elif "{alias}" in col_spec:
             target = col_spec.format(alias=scope)
         else:
             target = f"{scope}.{col_spec}"
@@ -962,6 +966,89 @@ def customer_price_join(alias: str, dims: list) -> str:
 
 
 # ---------------------------------------------------------------------------
+# brand_psp — dimension/filtre "Conciergerie × PSP réel".
+# Doc Notion "Identifier le couple PSP x Brand (Warning NMI)". Niveau membership.
+# PSP réel = ms_default_psp hors NMI ; pour NMI = MidId de la transaction R0
+# (silver_sgw.stg_transactions) mappé via le référentiel. Pattern = customer_price :
+# CTE brand_psp_map (membership_id -> brand_psp), LEFT JOIN, exposé en 'RAW:'.
+# ---------------------------------------------------------------------------
+# Subquery : MidId de la transaction R0 NMI par membership (référentiel doc).
+# BORNÉE par t_date (la fenêtre) -> indispensable pour la perf (sinon scan de
+# toute la table de transactions). date_filter et extra_from sont fournis par
+# l'appelant pour borner sur window_bounds (funnel/vamp) ou des dates explicites.
+def _r0_mid_subquery(date_filter: str, extra_from: str = "") -> str:
+    return (
+        "SELECT f.membership_id, ANY_VALUE(s.MidId) AS MidId\n"
+        "    FROM `eu-andy-marketing-raw.dashboard.fact_transactions` f\n"
+        "    JOIN `eu-andy-marketing-raw.silver_sgw.stg_transactions` s ON f.transaction_id = s.Id\n"
+        f"    {extra_from}\n"
+        "    WHERE f.t_psp_name = 'nmi' AND f.invoice_r_index = '0'\n"
+        f"    {date_filter}\n"
+        "    GROUP BY f.membership_id"
+    )
+
+
+def _brand_psp_concat(brand_col: str, psp_col: str, mid_alias: str) -> str:
+    """Expression 'Conciergerie - PSP réel' (doc Notion 'PSP x Brand / Warning NMI').
+    PSP réel = ms_default_psp hors NMI ; sinon mappe le MidId du R0. Le référentiel
+    MidId est centralisé ICI (à maintenir, cf. doc)."""
+    conc = (
+        f"CASE LOWER(TRIM(SPLIT(COALESCE({brand_col}, ''), ' - ')[OFFSET(0)])) "
+        "WHEN 'rezaflash' THEN 'Rezaflash' WHEN 'reserv-go' THEN 'Reserv-Go' "
+        "WHEN 'book-ici' THEN 'Book-Ici' WHEN 'resadexa' THEN 'Resadexa' "
+        "WHEN 'concimax' THEN 'Concimax' WHEN 'jumpaide.com' THEN 'jumpaide.com' "
+        "WHEN 'rapidoxy' THEN 'Rapidoxy' WHEN 'helpprio.com' THEN 'helpprio.com' "
+        "WHEN 'concicast' THEN 'Concicast' "
+        f"ELSE TRIM(SPLIT(COALESCE({brand_col}, ''), ' - ')[OFFSET(0)]) END"
+    )
+    psp = (
+        f"CASE WHEN {psp_col} <> 'nmi' THEN {psp_col} "
+        f"WHEN {mid_alias}.MidId = '688b5f4e-4f33-4b16-b2c7-6c601ba15306' THEN 'EMS' "
+        f"WHEN {mid_alias}.MidId = '5f915cec-f0b3-40e9-9908-b3590b791448' THEN 'Kadima' "
+        f"WHEN {mid_alias}.MidId = '4a7af99e-20b3-48b3-8e93-6fc39f8012b0' THEN 'Cliq' "
+        f"WHEN {mid_alias}.MidId = '9cf8e38c-c719-4d33-a1e3-aaa72cf88cdd' THEN 'CASH' "
+        f"WHEN {mid_alias}.MidId = 'f6130732-c577-4d1d-9ab9-802900b478a0' THEN 'NMI-tsyskadimaems' "
+        "ELSE 'NMI-autre' END"
+    )
+    return f"CONCAT({conc}, ' - ', {psp})"
+
+
+def _needs_brand_psp(dims: list, filters: dict) -> bool:
+    return any(d[0] == "brand_psp" for d in dims) or bool(filters.get("brand_psp"))
+
+
+def brand_psp_cte(dims: list, filters: dict) -> str:
+    """CTE brand_psp_map (membership_id -> brand_psp), restreint à la fenêtre.
+    Renvoie ',\\nbrand_psp_map AS (...)' ; '' si brand_psp ni dim ni filtre.
+    Dépend de window_bounds -> émettre APRÈS weeks_cte / customer_price."""
+    if not _needs_brand_psp(dims, filters):
+        return ""
+    expr = _brand_psp_concat("m.brand", "m.ms_default_psp", "r")
+    r0sub = _r0_mid_subquery(
+        "AND f.t_date BETWEEN DATE_SUB(wb_r0.ws_min, INTERVAL 15 DAY) "
+        "AND DATE_ADD(wb_r0.ws_max, INTERVAL 15 DAY)",
+        "CROSS JOIN window_bounds wb_r0",
+    )
+    return f""",
+brand_psp_map AS (
+  SELECT m.membership_id, {expr} AS brand_psp
+  FROM `eu-andy-marketing-raw.dashboard.fact_memberships` m
+  LEFT JOIN (
+    {r0sub}
+  ) r ON r.membership_id = m.membership_id
+  CROSS JOIN window_bounds wb_bpsp
+  WHERE DATE(m.ms_datetime) BETWEEN wb_bpsp.ws_min AND wb_bpsp.ws_max
+)"""
+
+
+def brand_psp_join(alias: str, dims: list, filters: dict) -> str:
+    """LEFT JOIN brand_psp_map sur membership_id, ou '' si brand_psp non utilisé."""
+    if not _needs_brand_psp(dims, filters):
+        return ""
+    return f"LEFT JOIN brand_psp_map bpsp ON bpsp.membership_id = {alias}.membership_id"
+
+
+# ---------------------------------------------------------------------------
 # Funnel query (one per brand_type) — supports dynamic dimensions
 # ---------------------------------------------------------------------------
 def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date] = None,
@@ -996,6 +1083,9 @@ def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date
     cp_join_ft = customer_pool_join("ft", filters)
     cp_price_cte = customer_price_cte(dims)
     cp_price_join_fm = customer_price_join("fm", dims)
+    bpsp_cte = brand_psp_cte(dims, filters)
+    bpsp_join_fm = brand_psp_join("fm", dims, filters)
+    bpsp_join_ft = brand_psp_join("ft", dims, filters)
     # Cohorte A/B : INNER JOIN sur la whitelist de customers (si fournie).
     cohort_join_fm = (
         f"  INNER JOIN (\n{cohort_pool_sql}\n  ) cohort_pool ON cohort_pool.customer_id = fm.customer_id"
@@ -1040,7 +1130,7 @@ def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date
     return f"""
 DECLARE cutoff_ts TIMESTAMP DEFAULT TIMESTAMP(CURRENT_DATE());
 DECLARE default_days INT64 DEFAULT {default_days};
-{weeks_cte}{cp_cte}{cp_price_cte},
+{weeks_cte}{cp_cte}{cp_price_cte}{bpsp_cte},
 bm AS (
   SELECT
     DATE_TRUNC(DATE(c.CreatedAtUtc), {trunc_arg}) AS cohort_week,
@@ -1052,6 +1142,7 @@ bm AS (
     ON CAST(fm.membership_id AS STRING) = CAST(sm.Id AS STRING)
   {cp_join_fm}
   {cp_price_join_fm}
+  {bpsp_join_fm}
 {cohort_join_fm}
   CROSS JOIN window_bounds wb
   WHERE DATE(c.CreatedAtUtc) BETWEEN wb.ws_min AND wb.ws_max
@@ -1090,6 +1181,7 @@ bt AS (
   FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
   JOIN `eu-andy-marketing-raw.silver_sgw.stg_customers` c ON ft.customer_id = c.Id
   {cp_join_ft}
+  {bpsp_join_ft}
 {cohort_join_ft}
   CROSS JOIN window_bounds wb
   WHERE DATE(c.CreatedAtUtc) BETWEEN wb.ws_min AND wb.ws_max
@@ -1230,6 +1322,8 @@ def vamp_cohort_sql(filters: dict, dims: list, weeks_list: List[date] = None) ->
     cp_join_ft = customer_pool_join("ft", filters)
     cp_price_cte = customer_price_cte(dims)
     cp_price_join_ft = customer_price_join("ft", dims)
+    bpsp_cte = brand_psp_cte(dims, filters)
+    bpsp_join_ft = brand_psp_join("ft", dims, filters)
     ft_filter = row_level_filter_clause("ft", filters)
     bm_dim_sel = dim_select_clause("ft", dims)
     dims_only_trailing = dim_cols_trailing(dims)
@@ -1249,7 +1343,7 @@ def vamp_cohort_sql(filters: dict, dims: list, weeks_list: List[date] = None) ->
     )
 
     return f"""
-{weeks_cte}{cp_cte}{cp_price_cte},
+{weeks_cte}{cp_cte}{cp_price_cte}{bpsp_cte},
 tx AS (
   SELECT ft.transaction_id, ft.brand_type, ft.invoice_r_index, ft.transaction_amount,
 {bm_dim_sel}    DATE_TRUNC(DATE(c.CreatedAtUtc), {trunc_arg}) AS cohort_week
@@ -1257,6 +1351,7 @@ tx AS (
   JOIN `eu-andy-marketing-raw.silver_sgw.stg_customers` c ON ft.customer_id = c.Id
   {cp_join_ft}
   {cp_price_join_ft}
+  {bpsp_join_ft}
   CROSS JOIN window_bounds wb
   WHERE DATE(c.CreatedAtUtc) BETWEEN wb.ws_min AND wb.ws_max
     AND COALESCE(ft.t_brand, '') NOT LIKE '%helpprio%'
@@ -1313,6 +1408,9 @@ def vamp_date_sql(filters: dict, dims: list, weeks_list: List[date] = None) -> s
     cp_price_cte = customer_price_cte(dims)
     cp_price_join_ft = customer_price_join("ft", dims)
     cp_price_join_t = customer_price_join("t", dims)
+    bpsp_cte = brand_psp_cte(dims, filters)
+    bpsp_join_ft = brand_psp_join("ft", dims, filters)
+    bpsp_join_t = brand_psp_join("t", dims, filters)
     ft_filter = row_level_filter_clause("ft", filters)
     ft_filter_t = row_level_filter_clause("t", filters)
     bm_dim_sel_ft = dim_select_clause("ft", dims)
@@ -1334,13 +1432,14 @@ def vamp_date_sql(filters: dict, dims: list, weeks_list: List[date] = None) -> s
     )
 
     return f"""
-{weeks_cte}{cp_cte}{cp_price_cte},
+{weeks_cte}{cp_cte}{cp_price_cte}{bpsp_cte},
 tx AS (
   SELECT ft.transaction_id, ft.brand_type, ft.invoice_r_index, ft.transaction_amount,
 {bm_dim_sel_ft}    DATE_TRUNC(ft.t_date, {trunc_arg}) AS tx_week
   FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
   {cp_join_ft}
   {cp_price_join_ft}
+  {bpsp_join_ft}
   CROSS JOIN window_bounds wb
   WHERE ft.t_date BETWEEN wb.ws_min AND wb.ws_max
     AND COALESCE(ft.t_brand, '') NOT LIKE '%helpprio%'
@@ -1378,6 +1477,7 @@ al_tx AS (
   FROM al a JOIN `eu-andy-marketing-raw.dashboard.fact_transactions` t ON a.transaction_id = t.transaction_id
   {cp_join_t}
   {cp_price_join_t}
+  {bpsp_join_t}
   WHERE COALESCE(t.t_brand, '') NOT LIKE '%helpprio%'
     AND LOWER(t.customer_email) NOT LIKE '%@yopmail%'
     AND LOWER(t.customer_email) NOT LIKE '%@sharebot%'
@@ -1412,6 +1512,7 @@ def filter_options_sql(start: date = None, end: date = None) -> str:
     booking_bucket = BOOKING_PRICE_EXPR.format(alias="fm")
     magazine_bucket = MAGAZINE_PRICE_EXPR.format(alias="fm")
     conciergerie = CONCIERGERIE_EXPR_FM.format(alias="fm")
+    brand_psp = _brand_psp_concat("fm.brand", "fm.ms_default_psp", "rmid")
     # Build window bounds — fall back to last 80 days if no range provided.
     if start and end:
         ws_min = f"DATE '{start.isoformat()}'"
@@ -1427,12 +1528,16 @@ fm_recent AS (
   SELECT
     COALESCE(fm.ms_default_psp,     '') AS psp,
     COALESCE({conciergerie},        '') AS conciergerie,
+    COALESCE({brand_psp},           '') AS brand_psp,
     COALESCE(fm.sgw_verticale,      '') AS verticale,
     COALESCE(fm.ms_currency,        '') AS currency,
     COALESCE(fm.sgw_booking_market, '') AS booking_market,
     COALESCE({booking_bucket},      '') AS price_booking,
     COALESCE({magazine_bucket},     '') AS price_magazine
   FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm
+  LEFT JOIN (
+    {_r0_mid_subquery(f"AND f.t_date BETWEEN DATE_SUB({ws_min}, INTERVAL 15 DAY) AND DATE_ADD({ws_max}, INTERVAL 15 DAY)")}
+  ) rmid ON rmid.membership_id = fm.membership_id
   CROSS JOIN wb
   WHERE DATE(fm.ms_datetime) BETWEEN wb.ws_min AND wb.ws_max
     AND COALESCE(fm.brand, '') NOT LIKE '%helpprio%'
@@ -1441,7 +1546,7 @@ fm_recent AS (
     AND LOWER(fm.customer_firstname) NOT LIKE '%test%'
 )
 SELECT dim, val, COUNT(*) AS n FROM fm_recent
-UNPIVOT (val FOR dim IN (psp, conciergerie, verticale, currency, booking_market, price_booking, price_magazine))
+UNPIVOT (val FOR dim IN (psp, conciergerie, brand_psp, verticale, currency, booking_market, price_booking, price_magazine))
 WHERE NOT (dim IN ('price_booking', 'price_magazine') AND val = '')
 GROUP BY 1,2
 ORDER BY 1, 3 DESC
@@ -4247,8 +4352,34 @@ AB_COHORTS = [
 AB_PSP_ORDER = ["TP", "NMI", "LBP"]
 AB_PSP_LABELS = {"TP": "TrustPayment", "NMI": "NMI", "LBP": "La Banque Postale"}
 
+# --- Test NMI Processor (lancé le 16/06 18h Paris) : EMS / New Kadima / Old Kadima ---
+# Identifié par membership.metadata.abNmiProcessor (A/B/C). ATTENTION : ce flag
+# est posé GLOBALEMENT sur tous les signups (toutes conciergeries), mais le
+# routage EMS/Kadima ne concerne que le NMI (Rezaflash) -> on filtre psp=nmi
+# pour ne pas polluer avec TP/Pixxles. Cutoff précis à 18h Paris (CreatedAtParis).
+NMIPROC_WINDOW_START = date(2026, 6, 16)
+NMIPROC_WINDOW_END = date.today()
+# Périmètre du test : NMI (Rezaflash), depuis le 16/06 18h Paris, et UNIQUEMENT
+# les deux prices "Conciergerie 6999" (Privilege exclu — partagé hors test).
+# 50470e1c = 6999 sur produit Rezaflash (A/B) ; b06a8912 = 6999 sur produit
+# Rezaflash-Kadima (C).
+_NMIPROC_PRICE_IDS = (
+    "'50470e1c-e90d-4a4a-90c1-7474a57787c0', 'b06a8912-f5b6-4b62-9c00-802a10789f70'"
+)
+_NMIPROC_SCOPE = (
+    "fm.ms_default_psp='nmi' "
+    "AND sm.CreatedAtParis >= '2026-06-16 18:00:00' "
+    f"AND sm.PriceId IN ({_NMIPROC_PRICE_IDS})"
+)
+NMIPROC_COHORTS = [
+    ("EMS (A)",        f"{_NMIPROC_SCOPE} AND JSON_VALUE(sm.Metadata,'$.abNmiProcessor')='A'"),
+    ("New Kadima (B)", f"{_NMIPROC_SCOPE} AND JSON_VALUE(sm.Metadata,'$.abNmiProcessor')='B'"),
+    ("Old Kadima (C)", f"{_NMIPROC_SCOPE} AND JSON_VALUE(sm.Metadata,'$.abNmiProcessor')='C'"),
+]
 
-def _ab_pool_sql(predicate: str) -> str:
+
+def _ab_pool_sql(predicate: str, win_start: date = AB_WINDOW_START,
+                 win_end: date = AB_WINDOW_END) -> str:
     """Subquery renvoyant les customer_id de la cohorte (membership Booking
     matchant le prédicat, signup dans la fenêtre). Injecté dans funnel_sql."""
     return (
@@ -4258,28 +4389,29 @@ def _ab_pool_sql(predicate: str) -> str:
         "      ON CAST(fm.membership_id AS STRING) = CAST(sm.Id AS STRING)\n"
         "    LEFT JOIN `eu-andy-marketing-raw.silver_sgw.stg_prices` pr\n"
         "      ON CAST(fm.price_id AS STRING) = CAST(pr.Id AS STRING)\n"
-        f"    WHERE DATE(sm.CreatedAtUtc) BETWEEN '{AB_WINDOW_START.isoformat()}' AND '{AB_WINDOW_END.isoformat()}'\n"
+        f"    WHERE DATE(sm.CreatedAtUtc) BETWEEN '{win_start.isoformat()}' AND '{win_end.isoformat()}'\n"
         "      AND fm.brand_type = 'Booking'\n"
         f"      AND ({predicate})"
     )
 
 
-# Fenêtre de cohorte côté funnel : jours de la fenêtre signup ± 1 jour de marge
-# (couvre l'écart de minuit entre customer.CreatedAtUtc et membership.CreatedAtUtc).
-# Le pool customer définit la vraie cohorte ; dims=[] => tout agrégé en UNE colonne.
-_AB_WEEKS = periods_in_range(
-    date.fromordinal(AB_WINDOW_START.toordinal() - 1),
-    date.fromordinal(AB_WINDOW_END.toordinal() + 1),
-    "date_day",
-)
+def _ab_weeks(win_start: date, win_end: date):
+    """Jours de la fenêtre signup ± 1 jour de marge (écart minuit customer vs
+    membership). Le pool customer définit la vraie cohorte ; dims=[] => 1 colonne."""
+    return periods_in_range(
+        date.fromordinal(win_start.toordinal() - 1),
+        date.fromordinal(win_end.toordinal() + 1),
+        "date_day",
+    )
 
 
-def ab_maturity_sql() -> str:
+def ab_maturity_sql(cohorts=AB_COHORTS, win_start: date = AB_WINDOW_START,
+                    win_end: date = AB_WINDOW_END) -> str:
     """Par cohorte : jours écoulés entre la veille minuit et le dernier R0 créé
-    (= dernier signup Booking de la cohorte), + nb de users. Sert à savoir quels
-    R sont analysables."""
+    (= dernier signup Booking de la cohorte), + nb de users. cohorts = liste de
+    (group, name, predicate)."""
     parts = []
-    for psp, name, pred in AB_COHORTS:
+    for psp, name, pred in cohorts:
         parts.append(
             f"SELECT '{psp}' AS psp, '{name}' AS cohort,\n"
             "  DATE_DIFF(DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY), DATE(MAX(sm.CreatedAtUtc)), DAY) AS days_elapsed,\n"
@@ -4290,25 +4422,25 @@ def ab_maturity_sql() -> str:
             "  ON CAST(fm.membership_id AS STRING) = CAST(sm.Id AS STRING)\n"
             "LEFT JOIN `eu-andy-marketing-raw.silver_sgw.stg_prices` pr\n"
             "  ON CAST(fm.price_id AS STRING) = CAST(pr.Id AS STRING)\n"
-            f"WHERE DATE(sm.CreatedAtUtc) BETWEEN '{AB_WINDOW_START.isoformat()}' AND '{AB_WINDOW_END.isoformat()}'\n"
+            f"WHERE DATE(sm.CreatedAtUtc) BETWEEN '{win_start.isoformat()}' AND '{win_end.isoformat()}'\n"
             f"  AND fm.brand_type='Booking' AND ({pred})"
         )
     return "\nUNION ALL\n".join(parts)
 
 
-def build_ab_psp_table(psp_group: str) -> pd.DataFrame:
-    """Construit la table combinée d'un PSP : lignes = KPI funnel R0→R4,
-    colonnes = (cohorte × {Booking, Magazine}). Réutilise build_funnel_table
-    pour chaque (cohorte, brand) -> garantit des calculs identiques au funnel."""
-    cohorts = [(n, p) for (g, n, p) in AB_COHORTS if g == psp_group]
+def build_ab_table(cohorts, win_start: date, win_end: date) -> pd.DataFrame:
+    """Table combinée : lignes = KPI funnel R0→R4, colonnes = (cohorte ×
+    {Booking, Magazine}). cohorts = liste de (name, predicate). Réutilise
+    build_funnel_table -> calculs identiques au funnel."""
+    weeks = _ab_weeks(win_start, win_end)
     groups = [(name, brand) for (name, _pred) in cohorts for brand in ("Booking", "Magazine")]
     col_dicts: dict = {}
     for name, pred in cohorts:
-        pool = _ab_pool_sql(pred)
+        pool = _ab_pool_sql(pred, win_start, win_end)
         for brand in ("Booking", "Magazine"):
-            df = run_query(funnel_sql(brand, {}, [], _AB_WEEKS,
+            df = run_query(funnel_sql(brand, {}, [], weeks,
                                       granularity_override="date_day", cohort_pool_sql=pool))
-            tbl = build_funnel_table(df, brand, [], picked_end=AB_WINDOW_END)
+            tbl = build_funnel_table(df, brand, [], picked_end=win_end)
             col_dicts[(name, brand)] = {
                 str(r["__key__"]): r.get(("Total",), "") for _, r in tbl.iterrows()
             }
@@ -4328,6 +4460,11 @@ def build_ab_psp_table(psp_group: str) -> pd.DataFrame:
     out.attrs["dims"] = [("cohort", "Cohorte", "", ""), ("brand", "Abo", "", "")]
     out.attrs["groups"] = groups
     return out
+
+
+def build_ab_psp_table(psp_group: str) -> pd.DataFrame:
+    cohorts = [(n, p) for (g, n, p) in AB_COHORTS if g == psp_group]
+    return build_ab_table(cohorts, AB_WINDOW_START, AB_WINDOW_END)
 
 
 def render_ab_maturity(df_mat: pd.DataFrame, psp_group: str) -> str:
@@ -4585,3 +4722,21 @@ elif page == "Analyse A/B":
             st.markdown(render_dd_tp_matrix(_dd), unsafe_allow_html=True)
         except Exception as e:
             st.error(f"Erreur Focus DD TP : {e}")
+
+    st.divider()
+    st.subheader("Test NMI Processor — EMS / New Kadima / Old Kadima")
+    st.caption(
+        "Flag `abNmiProcessor` (A = EMS, B = New Kadima, C = Old Kadima), "
+        "scopé NMI / Rezaflash + plan 6999 uniquement (Privilege exclu). "
+        "Depuis le 16/06 18h Paris → aujourd'hui (glissante)."
+    )
+    with st.spinner("Test NMI Processor…"):
+        try:
+            _np_mat = run_query(ab_maturity_sql(
+                [("NMI Proc", n, p) for n, p in NMIPROC_COHORTS],
+                NMIPROC_WINDOW_START, NMIPROC_WINDOW_END))
+            st.markdown(render_ab_maturity(_np_mat, "NMI Proc"), unsafe_allow_html=True)
+            _np_tbl = build_ab_table(NMIPROC_COHORTS, NMIPROC_WINDOW_START, NMIPROC_WINDOW_END)
+            st.markdown(render_table_html(_np_tbl), unsafe_allow_html=True)
+        except Exception as e:
+            st.error(f"Erreur Test NMI Processor : {e}")
