@@ -2947,6 +2947,73 @@ _EXEC_PSP_LABELS = {
 }
 _EXEC_BRUT_MIN = 10000.0  # une colonne s'affiche si brut s1 >= ce seuil (€ encaissés)
 
+# CSS de base partagé par les DEUX onglets Exec (Summary + Billing). Émis par
+# chaque rendu (avec la nav par page, chaque page doit porter son propre CSS).
+# Conteneur scrollable horizontal + colonne KPI sticky à gauche + largeur min
+# des colonnes -> on voit toujours toutes les colonnes même quand il y en a
+# beaucoup (dimension Conciergerie × PSP réel dynamique).
+_EXEC_BASE_CSS = """
+    <style>
+      .exec-summary { font-size: 14px; }
+      .exec-period {
+        background: #fef3c7; border-left: 4px solid #f59e0b; padding: 8px 12px;
+        border-radius: 4px; margin-bottom: 16px; font-size: 13px;
+      }
+      .exec-section {
+        font-size: 16px; font-weight: 700; color: #0f172a; margin: 20px 0 10px 0;
+        padding-bottom: 6px; border-bottom: 2px solid #e2e8f0;
+      }
+      .exec-cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 8px; }
+      .exec-card {
+        background: white; border: 1px solid #cbd5e1; border-radius: 8px;
+        padding: 14px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+      }
+      .exec-card-head { font-size: 12px; font-weight: 700; text-transform: uppercase; color: #475569; letter-spacing: 0.05em; }
+      .exec-card-sub { font-size: 11px; color: #94a3b8; margin-top: 2px; margin-bottom: 8px; }
+      .exec-card-value { font-size: 30px; font-weight: 700; color: #0f172a; line-height: 1.1; }
+      .exec-card-foot { font-size: 12px; color: #64748b; margin-top: 6px; }
+      /* Conteneur scrollable horizontal (porte la bordure/radius) */
+      .exec-scroll {
+        overflow-x: auto; max-width: 100%;
+        border: 1px solid #cbd5e1; border-radius: 8px; background: white;
+      }
+      .exec-table {
+        border-collapse: separate; border-spacing: 0; width: 100%;
+        background: white; font-size: 13px;
+      }
+      .exec-table thead th {
+        background: #0f172a; color: white; padding: 10px 12px; text-align: center;
+        font-weight: 600; border-bottom: 2px solid #1e293b;
+        min-width: 96px; white-space: nowrap;
+      }
+      .exec-table thead th.exec-kpi-label {
+        text-align: left; background: #1e293b; left: 0; position: sticky; z-index: 3;
+        min-width: 210px;
+      }
+      .exec-th-conc { font-size: 13px; font-weight: 700; }
+      .exec-th-total { border-left: 3px solid #475569 !important; background: #1e293b !important; }
+      .exec-total-cell { border-left: 3px solid #475569 !important; background: #f1f5f9 !important; font-weight: 700; }
+      .exec-total-cell .exec-cell-val { font-size: 15px !important; font-weight: 700 !important; }
+      .exec-th-psp  { font-size: 11px; opacity: 0.75; font-weight: 400; margin-top: 2px; }
+      .exec-table tbody td {
+        padding: 10px 12px; text-align: center; border-bottom: 1px solid #e2e8f0;
+        vertical-align: middle; min-width: 96px; white-space: nowrap;
+      }
+      .exec-table tbody tr:last-child td { border-bottom: none; }
+      .exec-table tbody tr:nth-child(even) td { background: #f8fafc; }
+      .exec-kpi-label {
+        text-align: left !important; font-weight: 700; color: #0f172a;
+        background: #f1f5f9 !important; position: sticky; left: 0; z-index: 2;
+        min-width: 210px;
+      }
+      .exec-cell-val { font-size: 14px; font-weight: 600; color: #0f172a; }
+      .exec-cell-wow { font-size: 11px; margin-top: 3px; }
+      .exec-wow-good    { color: #059669; font-weight: 600; }
+      .exec-wow-bad     { color: #dc2626; font-weight: 600; }
+      .exec-wow-neutral { color: #94a3b8; }
+    </style>
+    """
+
 
 def _exec_psp_reel(psp_col: str, mid_alias: str) -> str:
     """PSP réel COLLAPSÉ pour l'Exec : hors NMI = ms_default_psp ; NMI = EMS /
@@ -3690,6 +3757,7 @@ def render_exec_summary(df: pd.DataFrame, period_start: date, period_end: date) 
       .exec-wow-neutral { color: #94a3b8; }
     </style>
     """
+    css = _EXEC_BASE_CSS  # CSS partagé (scroll horizontal + colonne KPI sticky)
 
     return (
         css
@@ -3697,8 +3765,8 @@ def render_exec_summary(df: pd.DataFrame, period_start: date, period_end: date) 
         + f"<div class='exec-period'>📅 {period_label} (Month-to-Date · indépendant des filtres de la sidebar)</div>"
         + "<h3 class='exec-section'>Alertes Visa par société — MTD (hors Order Insight)</h3>"
         + cards_html
-        + "<h3 class='exec-section'>KPI MTD par Conciergerie × PSP</h3>"
-        + table_html
+        + "<h3 class='exec-section'>KPI MTD par Conciergerie × PSP réel</h3>"
+        + "<div class='exec-scroll'>" + table_html + "</div>"
         + "</div>"
     )
 
@@ -4257,11 +4325,11 @@ def render_exec_billing(df: pd.DataFrame,
     """
 
     return (
-        css_extra
+        _EXEC_BASE_CSS + css_extra
         + "<div class='exec-summary'>"
         + f"<div class='exec-period'>📅 {period_label}</div>"
-        + "<h3 class='exec-section'>Executive Summary Billing — par semaine vs S-1</h3>"
-        + table_html
+        + "<h3 class='exec-section'>Executive Summary Billing — par Conciergerie × PSP réel</h3>"
+        + "<div class='exec-scroll'>" + table_html + "</div>"
         + "</div>"
     )
 
