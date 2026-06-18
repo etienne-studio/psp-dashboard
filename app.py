@@ -1004,11 +1004,11 @@ def _brand_psp_concat(brand_col: str, psp_col: str, mid_alias: str) -> str:
     psp = (
         f"CASE WHEN {psp_col} <> 'nmi' THEN {psp_col} "
         f"WHEN {mid_alias}.MidId = '688b5f4e-4f33-4b16-b2c7-6c601ba15306' THEN 'EMS' "
-        f"WHEN {mid_alias}.MidId = '5f915cec-f0b3-40e9-9908-b3590b791448' THEN 'Kadima' "
+        f"WHEN {mid_alias}.MidId IN ('5f915cec-f0b3-40e9-9908-b3590b791448', "
+        f"'f6130732-c577-4d1d-9ab9-802900b478a0') THEN 'Kadima' "  # tsyskadimaems = Kadima
         f"WHEN {mid_alias}.MidId = '4a7af99e-20b3-48b3-8e93-6fc39f8012b0' THEN 'Cliq' "
         f"WHEN {mid_alias}.MidId = '9cf8e38c-c719-4d33-a1e3-aaa72cf88cdd' THEN 'CASH' "
-        f"WHEN {mid_alias}.MidId = 'f6130732-c577-4d1d-9ab9-802900b478a0' THEN 'NMI-tsyskadimaems' "
-        "ELSE 'NMI-autre' END"
+        f"ELSE {psp_col} END"  # MID non déterminé (ex. R0 sans tx) -> gateway 'nmi'
     )
     return f"CONCAT({conc}, ' - ', {psp})"
 
