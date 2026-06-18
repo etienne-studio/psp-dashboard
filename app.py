@@ -2935,6 +2935,51 @@ EXEC_COMPANIES = [
     ("NOV", ["Rezaflash"]),
 ]
 
+# --- Exec Summary : dimension Conciergerie × PSP réel ----------------------
+# Les colonnes ne sont plus des paires hardcodées mais (conciergerie, psp_réel)
+# présentes dans la data, filtrées par un seuil de CA encaissé (brut s1).
+_EXEC_CONC_ORDER = ["Reserv-Go", "Book-Ici", "Resadexa", "Concimax",
+                    "Jumpaide", "Rapidoxy", "Rezaflash"]
+_EXEC_PSP_LABELS = {
+    "trustpayment": "Trustpayment", "pixxles": "Pixxles",
+    "labanquepostale": "La Banque Postale", "emerchantpay": "eMerchantPay",
+    "EMS": "EMS", "Kadima": "Kadima", "autres": "NMI autres",
+}
+_EXEC_BRUT_MIN = 10000.0  # une colonne s'affiche si brut s1 >= ce seuil (€ encaissés)
+
+
+def _exec_psp_reel(psp_col: str, mid_alias: str) -> str:
+    """PSP réel COLLAPSÉ pour l'Exec : hors NMI = ms_default_psp ; NMI = EMS /
+    Kadima / 'autres' (Cliq+CASH+nmi regroupés). MidId du R0 via {mid_alias}."""
+    return (
+        f"CASE WHEN {psp_col} <> 'nmi' THEN {psp_col} "
+        f"WHEN {mid_alias}.MidId = '688b5f4e-4f33-4b16-b2c7-6c601ba15306' THEN 'EMS' "
+        f"WHEN {mid_alias}.MidId IN ('5f915cec-f0b3-40e9-9908-b3590b791448', "
+        f"'f6130732-c577-4d1d-9ab9-802900b478a0') THEN 'Kadima' "
+        f"ELSE 'autres' END"
+    )
+
+
+def _exec_psp_label(psp: str) -> str:
+    return _EXEC_PSP_LABELS.get(psp, psp)
+
+
+def _exec_all_pairs(data: dict) -> set:
+    """Toutes les paires (conciergerie, psp) présentes dans data (pour les cards)."""
+    return {(c, p) for (c, p, _b) in data}
+
+
+def _exec_visible_pairs(data: dict, brut_metric: str = "brut",
+                        min_brut: float = _EXEC_BRUT_MIN) -> list:
+    """Paires (conciergerie, psp) à AFFICHER en colonnes = CA s1 >= seuil, triées
+    par ordre conciergerie puis psp. brut_metric = 'brut' (Exec) ou 'ca_brut'
+    (Billing)."""
+    def s1brut(c, p):
+        return data.get((c, p, "s1"), {}).get(brut_metric, 0.0)
+    vis = [(c, p) for (c, p) in _exec_all_pairs(data) if s1brut(c, p) >= min_brut]
+    return sorted(vis, key=lambda cp: (
+        _EXEC_CONC_ORDER.index(cp[0]) if cp[0] in _EXEC_CONC_ORDER else 99, cp[1]))
+
 
 def exec_summary_sql(period_start: date, period_end: date) -> str:
     """Build SQL for the Executive Summary tab.
@@ -3013,6 +3058,10 @@ def exec_summary_sql(period_start: date, period_end: date) -> str:
     fm_conc = _conc("fm", "brand")
     ft_conc = _conc("ft", "t_brand")
     t_conc  = _conc("t",  "t_brand")
+    # PSP réel collapsé (NMI -> EMS/Kadima/autres via MidId du R0). Alias 'rm'.
+    psp_fm = _exec_psp_reel("fm.ms_default_psp", "rm")
+    psp_ft = _exec_psp_reel("ft.ms_default_psp", "rm")
+    psp_t  = _exec_psp_reel("t.ms_default_psp",  "rm")
 
     # Les bornes s2 sont calculées côté Python par _exec_period_bounds()
     # pour gérer correctement le cas "mois complet" vs "MTD partiel".
@@ -3030,6 +3079,17 @@ WITH weeks_def AS (
     DATE '{s2s}' AS s2_start,
     DATE '{s2e}' AS s2_end
 ),
+r0_mid_map AS (
+  -- MidId du R0 NMI par membership (borné sur la fenêtre exec). Sert à
+  -- résoudre le PSP réel (EMS/Kadima/autres) pour le NMI.
+  SELECT f.membership_id, ANY_VALUE(s.MidId) AS MidId
+  FROM `eu-andy-marketing-raw.dashboard.fact_transactions` f
+  JOIN `eu-andy-marketing-raw.silver_sgw.stg_transactions` s ON f.transaction_id = s.Id
+  WHERE f.t_psp_name = 'nmi' AND f.invoice_r_index = '0'
+    AND f.t_date BETWEEN DATE_SUB((SELECT s2_start FROM weeks_def), INTERVAL 15 DAY)
+                     AND DATE_ADD((SELECT s1_end FROM weeks_def), INTERVAL 15 DAY)
+  GROUP BY f.membership_id
+),
 fm_in_window AS (
   SELECT
     fm.membership_id,
@@ -3038,10 +3098,11 @@ fm_in_window AS (
     fm.ms_status,
     fm.ms_date,
     fm.ms_trial_end,
-    fm.ms_default_psp AS psp,
+    {psp_fm} AS psp,
     COALESCE(fm.ms_cancelled_during_trial, FALSE) AS cancelled_during_trial,
     {fm_conc} AS conciergerie
   FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm
+  LEFT JOIN r0_mid_map rm ON rm.membership_id = fm.membership_id
   WHERE fm.ms_status NOT IN ('abandonned', 'processing')
     AND (
       (fm.ms_date       BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def))
@@ -3124,13 +3185,14 @@ ft_in_window AS (
     ft.transaction_amount,
     ft.transaction_status,
     ft.invoice_r_index,
-    ft.ms_default_psp AS psp,
+    {psp_ft} AS psp,
     {ft_conc} AS conciergerie,
     CASE
       WHEN ft.t_date BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
       WHEN ft.t_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s2_end FROM weeks_def) THEN 's2'
     END AS bucket
   FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
+  LEFT JOIN r0_mid_map rm ON rm.membership_id = ft.membership_id
   WHERE ft.t_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
 ),
 refund_in_window AS (
@@ -3141,26 +3203,28 @@ refund_in_window AS (
   SELECT
     ft.transaction_id,
     ft.transaction_amount,
-    ft.ms_default_psp AS psp,
+    {psp_ft} AS psp,
     {ft_conc} AS conciergerie,
     CASE
       WHEN ft.refunded_at_utc BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
       WHEN ft.refunded_at_utc BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s2_end FROM weeks_def) THEN 's2'
     END AS bucket
   FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
+  LEFT JOIN r0_mid_map rm ON rm.membership_id = ft.membership_id
   WHERE ft.is_refunded = TRUE
     AND ft.refunded_at_utc BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
 ),
 ft_visa_in_window AS (
   -- Visa-only succeeded tx — used as VAMP denominator. Includes DELTA
   -- (Visa Debit UK, same network). All R indexes counted.
-  SELECT ft.transaction_id, ft.t_date, ft.ms_default_psp AS psp,
+  SELECT ft.transaction_id, ft.t_date, {psp_ft} AS psp,
     {ft_conc} AS conciergerie,
     CASE
       WHEN ft.t_date BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
       WHEN ft.t_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s2_end FROM weeks_def) THEN 's2'
     END AS bucket
   FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
+  LEFT JOIN r0_mid_map rm ON rm.membership_id = ft.membership_id
   WHERE ft.t_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
     AND ft.transaction_status = 'succeeded'
     AND UPPER(ft.t_card_brand) IN ('VISA', 'DELTA')
@@ -3190,7 +3254,7 @@ alerts_join AS (
   SELECT
     fa.transaction_id, fa.alerted_at,
     {t_conc} AS conciergerie,
-    t.ms_default_psp AS psp,
+    {psp_t} AS psp,
     t.invoice_r_index,
     CASE
       WHEN fa.alerted_at BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
@@ -3198,6 +3262,7 @@ alerts_join AS (
     END AS bucket
   FROM `eu-andy-marketing-raw.dashboard.fact_alert` fa
   JOIN `eu-andy-marketing-raw.dashboard.fact_transactions` t USING (transaction_id)
+  LEFT JOIN r0_mid_map rm ON rm.membership_id = t.membership_id
   WHERE fa.alerted_at BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
     AND UPPER(fa.cardnetwork) = 'VISA'
 ),
@@ -3344,6 +3409,11 @@ def render_exec_summary(df: pd.DataFrame, period_start: date, period_end: date) 
     def m(conc, psp, bucket, metric):
         return data.get((conc, psp, bucket), {}).get(metric, 0.0)
 
+    # Colonnes dynamiques (conciergerie × psp réel). pairs = affichées (brut s1
+    # >= seuil) ; all_pairs = toutes (pour les cards société). Format (c, p, label).
+    pairs = [(c, p, _exec_psp_label(p)) for (c, p) in _exec_visible_pairs(data)]
+    all_pairs = [(c, p, _exec_psp_label(p)) for (c, p) in _exec_all_pairs(data)]
+
     # --- French number formatters ---
     def fr_int(v):
         return f"{int(round(v)):,}".replace(",", " ")
@@ -3375,8 +3445,8 @@ def render_exec_summary(df: pd.DataFrame, period_start: date, period_end: date) 
     # --- Top: company cards (Visa alerts MTD, WoW vs MTD M-1) ---
     cards = []
     for company, conciergeries in EXEC_COMPANIES:
-        s1 = sum(m(c, p, "s1", "alerts_visa") for (c, p, _l) in EXEC_PSP_PAIRS if c in conciergeries)
-        s2 = sum(m(c, p, "s2", "alerts_visa") for (c, p, _l) in EXEC_PSP_PAIRS if c in conciergeries)
+        s1 = sum(m(c, p, "s1", "alerts_visa") for (c, p, _l) in all_pairs if c in conciergeries)
+        s2 = sum(m(c, p, "s2", "alerts_visa") for (c, p, _l) in all_pairs if c in conciergeries)
         delta = wow_html(wow_pct(s1, s2), lower_is_better=True)
         # Sub-label: list of conciergeries inside
         sub = " · ".join(conciergeries)
@@ -3396,13 +3466,13 @@ def render_exec_summary(df: pd.DataFrame, period_start: date, period_end: date) 
         f"<div class='exec-th-conc'>{c}</div>"
         f"<div class='exec-th-psp'>({lbl})</div>"
         "</th>"
-        for (c, p, lbl) in EXEC_PSP_PAIRS
+        for (c, p, lbl) in pairs
     )
-    header_cells += "<th class='exec-th-total'><div class='exec-th-conc'>Total</div><div class='exec-th-psp'>(7 paires)</div></th>"
+    header_cells += f"<th class='exec-th-total'><div class='exec-th-conc'>Total</div><div class='exec-th-psp'>({len(pairs)} colonnes)</div></th>"
 
     def kpi_row(label, fmt, compute_fn, total_fn=None, lower_is_better=False):
         cells = []
-        for (c, p, _lbl) in EXEC_PSP_PAIRS:
+        for (c, p, _lbl) in pairs:
             v1 = compute_fn(c, p, "s1")
             v2 = compute_fn(c, p, "s2")
             value_str = fmt(v1) if v1 is not None else "—"
@@ -3452,7 +3522,7 @@ def render_exec_summary(df: pd.DataFrame, period_start: date, period_end: date) 
 
     # ---- Total fns (agrégation correcte par KPI) --------------------------
     def _sum_atom(b, atom):
-        return sum(m(c, p, b, atom) for (c, p, _l) in EXEC_PSP_PAIRS)
+        return sum(m(c, p, b, atom) for (c, p, _l) in pairs)
 
     def total_r0(b):
         return _sum_atom(b, "r0")
@@ -3724,6 +3794,8 @@ def exec_billing_sql(s1_start: date, s1_end: date,
 
     ft_conc = _conc("ft", "t_brand")
     t_conc  = _conc("t",  "t_brand")
+    psp_ft = _exec_psp_reel("ft.ms_default_psp", "rm")
+    psp_t  = _exec_psp_reel("t.ms_default_psp",  "rm")
 
     s1s, s1e, s2s, s2e = (d.isoformat() for d in (s1_start, s1_end, s2_start, s2_end))
 
@@ -3735,6 +3807,15 @@ WITH weeks_def AS (
     DATE '{s2s}' AS s2_start,
     DATE '{s2e}' AS s2_end
 ),
+r0_mid_map AS (
+  SELECT f.membership_id, ANY_VALUE(s.MidId) AS MidId
+  FROM `eu-andy-marketing-raw.dashboard.fact_transactions` f
+  JOIN `eu-andy-marketing-raw.silver_sgw.stg_transactions` s ON f.transaction_id = s.Id
+  WHERE f.t_psp_name = 'nmi' AND f.invoice_r_index = '0'
+    AND f.t_date BETWEEN DATE_SUB((SELECT s2_start FROM weeks_def), INTERVAL 15 DAY)
+                     AND DATE_ADD((SELECT s1_end FROM weeks_def), INTERVAL 15 DAY)
+  GROUP BY f.membership_id
+),
 ft_window AS (
   SELECT
     ft.transaction_id,
@@ -3745,25 +3826,27 @@ ft_window AS (
     ft.t_attempt_index,
     ft.t_card_brand,
     ft.customer_email,
-    ft.ms_default_psp AS psp,
+    {psp_ft} AS psp,
     {ft_conc} AS conciergerie,
     CASE
       WHEN ft.t_date BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
       WHEN ft.t_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s2_end FROM weeks_def) THEN 's2'
     END AS bucket
   FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
+  LEFT JOIN r0_mid_map rm ON rm.membership_id = ft.membership_id
   WHERE ft.t_date BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
 ),
 refund_window AS (
   SELECT
     ft.transaction_amount,
-    ft.ms_default_psp AS psp,
+    {psp_ft} AS psp,
     {ft_conc} AS conciergerie,
     CASE
       WHEN ft.refunded_at_utc BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
       WHEN ft.refunded_at_utc BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s2_end FROM weeks_def) THEN 's2'
     END AS bucket
   FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
+  LEFT JOIN r0_mid_map rm ON rm.membership_id = ft.membership_id
   WHERE ft.is_refunded = TRUE
     AND ft.refunded_at_utc BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
 ),
@@ -3771,7 +3854,7 @@ alerts_window AS (
   SELECT
     fa.transaction_id,
     fa.cardnetwork,
-    t.ms_default_psp AS psp,
+    {psp_t} AS psp,
     {t_conc} AS conciergerie,
     CASE
       WHEN fa.alerted_at BETWEEN (SELECT s1_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def) THEN 's1'
@@ -3779,6 +3862,7 @@ alerts_window AS (
     END AS bucket
   FROM `eu-andy-marketing-raw.dashboard.fact_alert` fa
   JOIN `eu-andy-marketing-raw.dashboard.fact_transactions` t USING (transaction_id)
+  LEFT JOIN r0_mid_map rm ON rm.membership_id = t.membership_id
   WHERE fa.alerted_at BETWEEN (SELECT s2_start FROM weeks_def) AND (SELECT s1_end FROM weeks_def)
 ),
 -- Processing
@@ -3879,6 +3963,9 @@ def render_exec_billing(df: pd.DataFrame,
     def m(c, p, b, metric):
         return data.get((c, p, b), {}).get(metric, 0.0)
 
+    # Colonnes dynamiques (conciergerie × psp réel) : CA encaissé (ca_brut s1) >= seuil.
+    pairs = [(c, p, _exec_psp_label(p)) for (c, p) in _exec_visible_pairs(data, "ca_brut")]
+
     # --- Formatters FR ---
     def fr_int(v):
         return f"{int(round(v)):,}".replace(",", " ")
@@ -3907,29 +3994,29 @@ def render_exec_billing(df: pd.DataFrame,
             cls = "exec-wow-good" if is_good else "exec-wow-bad"
         return f"<span class='{cls}'>{sign}{pct*100:.1f}%</span>".replace(".", ",")
 
-    # --- Header (7 paires + Total) ---
+    # --- Header (colonnes dynamiques + Total) ---
     header_cells = "".join(
         "<th>"
         f"<div class='exec-th-conc'>{c}</div>"
         f"<div class='exec-th-psp'>({lbl})</div>"
         "</th>"
-        for (c, p, lbl) in EXEC_PSP_PAIRS
+        for (c, p, lbl) in pairs
     )
     header_cells += (
         "<th class='exec-th-total'>"
         "<div class='exec-th-conc'>Total</div>"
-        "<div class='exec-th-psp'>(7 paires)</div>"
+        f"<div class='exec-th-psp'>({len(pairs)} colonnes)</div>"
         "</th>"
     )
 
     def _sum_atom(b, atom):
-        return sum(m(c, p, b, atom) for (c, p, _l) in EXEC_PSP_PAIRS)
+        return sum(m(c, p, b, atom) for (c, p, _l) in pairs)
 
     # --- KPI row builder ---
     def kpi_row(label, fmt, compute_fn, total_fn=None, lower_is_better=False,
                 section_class=""):
         cells = []
-        for (c, p, _lbl) in EXEC_PSP_PAIRS:
+        for (c, p, _lbl) in pairs:
             v1 = compute_fn(c, p, "s1")
             v2 = compute_fn(c, p, "s2")
             value_str = fmt(v1) if v1 is not None else "—"
@@ -3957,14 +4044,14 @@ def render_exec_billing(df: pd.DataFrame,
         return f"<tr class='{section_class}'><td class='exec-kpi-label'>{label}</td>{''.join(cells)}</tr>"
 
     def section_header(label, color_class):
-        n_cols = len(EXEC_PSP_PAIRS) + 2  # KPI col + 7 paires + Total
+        n_cols = len(pairs) + 2  # KPI col + colonnes + Total
         return (
             f"<tr class='billing-section-header {color_class}'>"
             f"<td colspan='{n_cols}'>{label}</td></tr>"
         )
 
     def subsection_header(label, color_class):
-        n_cols = len(EXEC_PSP_PAIRS) + 2
+        n_cols = len(pairs) + 2
         return (
             f"<tr class='billing-subsection-header {color_class}'>"
             f"<td colspan='{n_cols}'>{label}</td></tr>"
