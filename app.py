@@ -4003,11 +4003,26 @@ vamp_metrics AS (
   FROM alerts_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL
     AND UPPER(cardnetwork) = 'MASTERCARD'
   GROUP BY 1,2,3
+),
+col_ref AS (
+  -- Référence pour la SÉLECTION des colonnes (pas affichée) : CA encaissé sur
+  -- 30 jours glissants par Conciergerie × PSP réel, même échelle que l'Exec
+  -- Summary mensuel -> Billing affiche les MÊMES colonnes (seuil 10 k€).
+  SELECT {ft_conc} AS conciergerie, {psp_ft} AS psp, 's1' AS bucket,
+    'col_ca_ref' AS metric,
+    SUM(CASE WHEN ft.transaction_status='succeeded' THEN ft.transaction_amount ELSE 0 END) AS value
+  FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft
+  LEFT JOIN r0_mid_map rm ON rm.membership_id = ft.membership_id
+  WHERE ft.t_date BETWEEN DATE_SUB((SELECT s1_end FROM weeks_def), INTERVAL 29 DAY)
+                     AND (SELECT s1_end FROM weeks_def)
+  GROUP BY 1, 2
+  HAVING conciergerie IS NOT NULL
 )
 SELECT * FROM proc_metrics
 UNION ALL SELECT * FROM sr_r1_metrics
 UNION ALL SELECT * FROM sr_all_metrics
 UNION ALL SELECT * FROM vamp_metrics
+UNION ALL SELECT * FROM col_ref
 """
 
 
@@ -4031,8 +4046,10 @@ def render_exec_billing(df: pd.DataFrame,
     def m(c, p, b, metric):
         return data.get((c, p, b), {}).get(metric, 0.0)
 
-    # Colonnes dynamiques (conciergerie × psp réel) : CA encaissé (ca_brut s1) >= seuil.
-    pairs = [(c, p, _exec_psp_label(p)) for (c, p) in _exec_visible_pairs(data, "ca_brut")]
+    # Colonnes dynamiques (conciergerie × psp réel) — MÊMES colonnes que l'Exec
+    # Summary : sélection sur le CA encaissé 30 j glissants (col_ca_ref) >= seuil,
+    # pour ne pas masquer des colonnes à cause de la fenêtre hebdo plus courte.
+    pairs = [(c, p, _exec_psp_label(p)) for (c, p) in _exec_visible_pairs(data, "col_ca_ref")]
 
     # --- Formatters FR ---
     def fr_int(v):
