@@ -4863,15 +4863,22 @@ elif page == "Analyse A/B":
     st.caption(
         f"Analyse A/B — cohortes figées (signup {AB_WINDOW_START.strftime('%d/%m')} → "
         f"{AB_WINDOW_END.strftime('%d/%m/%Y')}). Indépendant de la sidebar. "
-        "Mêmes KPI que les funnels, par cohorte × Booking/Magazine."
+        "**Seule la section choisie se charge** (pour aller vite)."
     )
-    with st.spinner("Analyse A/B…"):
-        try:
-            df_mat = run_query(ab_maturity_sql())
-        except Exception as e:
-            st.error(f"Erreur maturité A/B : {e}")
-            df_mat = pd.DataFrame(columns=["psp", "cohort", "days_elapsed", "last_r0", "users"])
-        for _psp in AB_PSP_ORDER:
+    # Sous-navigation : on ne lance QUE les requêtes de la section sélectionnée
+    # (avant : tout se chargeait d'un coup → ~25 requêtes funnel = très lent).
+    _AB_SECTIONS = ["TrustPayment", "NMI", "La Banque Postale", "Focus DD TP", "Test NMI Processor"]
+    _ab_sel = st.radio("Section", _AB_SECTIONS, horizontal=True, key="ab_section",
+                       label_visibility="collapsed")
+
+    if _ab_sel in ("TrustPayment", "NMI", "La Banque Postale"):
+        _psp = {"TrustPayment": "TP", "NMI": "NMI", "La Banque Postale": "LBP"}[_ab_sel]
+        with st.spinner(f"{_ab_sel}…"):
+            try:
+                df_mat = run_query(ab_maturity_sql())
+            except Exception as e:
+                st.error(f"Erreur maturité A/B : {e}")
+                df_mat = pd.DataFrame(columns=["psp", "cohort", "days_elapsed", "last_r0", "users"])
             st.subheader(AB_PSP_LABELS.get(_psp, _psp))
             st.markdown(render_ab_maturity(df_mat, _psp), unsafe_allow_html=True)
             try:
@@ -4879,36 +4886,35 @@ elif page == "Analyse A/B":
                 st.markdown(render_table_html(_ab_tbl), unsafe_allow_html=True)
             except Exception as e:
                 st.error(f"Erreur table A/B {_psp} : {e}")
-            st.divider()
 
-    # Focus DD TP — matrice cross-sell magazine cross-brand (conciergeries TP)
-    st.subheader("Focus — DD TP · magazine cross-brand")
-    st.caption(
-        "Cohorte DD TP (descripteur dynamique). Par conciergerie en Booking, "
-        "répartition des users sur le magazine d'une AUTRE conciergerie TP. "
-        "Attendu : Booking ≈ Total mag de la ligne."
-    )
-    with st.spinner("Focus DD TP…"):
-        try:
-            _dd = run_query(ab_dd_tp_matrix_sql())
-            st.markdown(render_dd_tp_matrix(_dd), unsafe_allow_html=True)
-        except Exception as e:
-            st.error(f"Erreur Focus DD TP : {e}")
+    elif _ab_sel == "Focus DD TP":
+        st.subheader("Focus — DD TP · magazine cross-brand")
+        st.caption(
+            "Cohorte DD TP (descripteur dynamique). Par conciergerie en Booking, "
+            "répartition des users sur le magazine d'une AUTRE conciergerie TP. "
+            "Attendu : Booking ≈ Total mag de la ligne."
+        )
+        with st.spinner("Focus DD TP…"):
+            try:
+                _dd = run_query(ab_dd_tp_matrix_sql())
+                st.markdown(render_dd_tp_matrix(_dd), unsafe_allow_html=True)
+            except Exception as e:
+                st.error(f"Erreur Focus DD TP : {e}")
 
-    st.divider()
-    st.subheader("Test NMI Processor — EMS / New Kadima / Old Kadima")
-    st.caption(
-        "Flag `abNmiProcessor` (A = EMS, B = New Kadima, C = Old Kadima), "
-        "scopé NMI / Rezaflash + plan 6999 uniquement (Privilege exclu). "
-        "Depuis le 16/06 18h Paris → aujourd'hui (glissante)."
-    )
-    with st.spinner("Test NMI Processor…"):
-        try:
-            _np_mat = run_query(ab_maturity_sql(
-                [("NMI Proc", n, p) for n, p in NMIPROC_COHORTS],
-                NMIPROC_WINDOW_START, NMIPROC_WINDOW_END))
-            st.markdown(render_ab_maturity(_np_mat, "NMI Proc"), unsafe_allow_html=True)
-            _np_tbl = build_ab_table(NMIPROC_COHORTS, NMIPROC_WINDOW_START, NMIPROC_WINDOW_END)
-            st.markdown(render_table_html(_np_tbl), unsafe_allow_html=True)
-        except Exception as e:
-            st.error(f"Erreur Test NMI Processor : {e}")
+    elif _ab_sel == "Test NMI Processor":
+        st.subheader("Test NMI Processor — EMS / New Kadima / Old Kadima")
+        st.caption(
+            "Flag `abNmiProcessor` (A = EMS, B = New Kadima, C = Old Kadima), "
+            "scopé NMI / Rezaflash + plan 6999 uniquement (Privilege exclu). "
+            "Depuis le 16/06 18h Paris → aujourd'hui (glissante)."
+        )
+        with st.spinner("Test NMI Processor…"):
+            try:
+                _np_mat = run_query(ab_maturity_sql(
+                    [("NMI Proc", n, p) for n, p in NMIPROC_COHORTS],
+                    NMIPROC_WINDOW_START, NMIPROC_WINDOW_END))
+                st.markdown(render_ab_maturity(_np_mat, "NMI Proc"), unsafe_allow_html=True)
+                _np_tbl = build_ab_table(NMIPROC_COHORTS, NMIPROC_WINDOW_START, NMIPROC_WINDOW_END)
+                st.markdown(render_table_html(_np_tbl), unsafe_allow_html=True)
+            except Exception as e:
+                st.error(f"Erreur Test NMI Processor : {e}")
