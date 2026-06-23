@@ -1052,7 +1052,13 @@ def brand_psp_join(alias: str, dims: list, filters: dict) -> str:
 # Funnel query (one per brand_type) — supports dynamic dimensions
 # ---------------------------------------------------------------------------
 def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date] = None,
-               granularity_override: str = None, cohort_pool_sql: str = None) -> str:
+               granularity_override: str = None, cohort_pool_sql: str = None,
+               max_rx: int = 4) -> str:
+    # max_rx (2..4) : plafonne le calcul du funnel à R{max_rx}. Par défaut 4
+    # (R0→R4, comportement inchangé pour les onglets Funnel). L'analyse A/B passe
+    # à 2 (cohortes fraîches : R3/R4 toujours vides) -> supprime 2 grosses
+    # jointures stg_memberships (r3/r4_tbb_raw) = beaucoup plus rapide.
+    max_rx = max(2, min(int(max_rx), 4))
     # granularity_override : force la granularité de cohorte (ex. 'date_day' pour
     #   l'onglet Analyse A/B) au lieu de la déduire des dims.
     # cohort_pool_sql : subquery renvoyant une colonne `customer_id`. Si fournie,
@@ -1110,6 +1116,43 @@ def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date
     dim_on_r1 = dim_join_on("r1", "da", dims)
     dim_on_s = dim_join_on("s", "da", dims)
     dim_on_tbb = dim_join_on("tbb", "da", dims)
+
+    # --- Chaîne R-suivants (R2..max_rx) assemblée dynamiquement -------------
+    # Chaque niveau R{n} a besoin de succ_r{n-1}, succ_next_r{n-1}, r{n}_elig,
+    # r{n}_tbb_raw (jointure stg_memberships = coûteuse). max_rx=4 reproduit le
+    # comportement complet ; max_rx=2 (A/B) saute r3/r4_tbb_raw.
+    def _succ(k):
+        return (f"succ_r{k} AS (\n"
+                f"  SELECT cohort_week, {dims_only_trailing}customer_email, membership_id, MIN(t_datetime) AS succ_dt,\n"
+                f"    ANY_VALUE(ms_billing_frequency) AS bf, ANY_VALUE(ms_billing_period) AS bp\n"
+                f"  FROM btx WHERE invoice_r_index='{k}' AND transaction_status='succeeded' GROUP BY ALL\n)")
+    def _succ_next(k):
+        return (f"succ_next_r{k} AS (\n"
+                f"  SELECT *, CASE WHEN bp='weeks' THEN TIMESTAMP_ADD(succ_dt, INTERVAL (CAST(bf AS INT64)*7) DAY)\n"
+                f"                 WHEN bp='months' THEN TIMESTAMP_ADD(succ_dt, INTERVAL (CAST(bf AS INT64)*30) DAY)\n"
+                f"                 ELSE TIMESTAMP_ADD(succ_dt, INTERVAL default_days DAY) END AS exp_next FROM succ_r{k}\n)")
+    def _rxelig(n):
+        return f"r{n}_elig AS (SELECT * FROM succ_next_r{n-1} WHERE exp_next <= cutoff_ts)"
+    def _rxtbb(n):
+        return (f"r{n}_tbb_raw AS (\n"
+                f"  SELECT e.cohort_week, {dim_cols_trailing(dims, 'e')}\n"
+                f"    COUNT(DISTINCT e.customer_email) AS elig_users,\n"
+                f"    COUNT(DISTINCT CASE WHEN sm.CancelAtUtc IS NOT NULL AND TIMESTAMP(sm.CancelAtUtc) < e.exp_next THEN e.customer_email END) AS cancel_users\n"
+                f"  FROM r{n}_elig e JOIN `eu-andy-marketing-raw.silver_sgw.stg_memberships` sm\n"
+                f"    ON CAST(e.membership_id AS STRING) = CAST(sm.Id AS STRING)\n"
+                f"  GROUP BY ALL\n)")
+    _rx_parts = []
+    for n in range(2, max_rx + 1):
+        _rx_parts += [_succ(n - 1), _succ_next(n - 1), _rxelig(n), _rxtbb(n)]
+    rx_chain = (",\n".join(_rx_parts) + ",\n") if _rx_parts else ""
+    _tbb_union = "\n  UNION ALL ".join(
+        f"SELECT cohort_week, {dims_only_trailing}'{n}' AS rx, elig_users, cancel_users FROM r{n}_tbb_raw"
+        for n in range(2, max_rx + 1))
+    tbb_join = (
+        f"LEFT JOIN (\n  {_tbb_union}\n) tbb ON tbb.cohort_week = w.week_start "
+        f"AND tbb.rx = rx_idx{dim_on_tbb}"
+    )
+
     has_nw = bool(non_week_dims(dims))
     dim_axis_join = (
         f"CROSS JOIN dim_axis da\n" if has_nw else ""
@@ -1200,64 +1243,7 @@ btx AS (
   FROM bt INNER JOIN elig_users e
     ON bt.cohort_week = e.cohort_week AND bt.customer_email = e.customer_email
 ),
-succ_r1 AS (
-  SELECT cohort_week, {dims_only_trailing}customer_email, membership_id, MIN(t_datetime) AS succ_dt,
-    ANY_VALUE(ms_billing_frequency) AS bf, ANY_VALUE(ms_billing_period) AS bp
-  FROM btx WHERE invoice_r_index='1' AND transaction_status='succeeded' GROUP BY ALL
-),
-succ_next_r1 AS (
-  SELECT *, CASE WHEN bp='weeks' THEN TIMESTAMP_ADD(succ_dt, INTERVAL (CAST(bf AS INT64)*7) DAY)
-                 WHEN bp='months' THEN TIMESTAMP_ADD(succ_dt, INTERVAL (CAST(bf AS INT64)*30) DAY)
-                 ELSE TIMESTAMP_ADD(succ_dt, INTERVAL default_days DAY) END AS exp_next FROM succ_r1
-),
-r2_elig AS (SELECT * FROM succ_next_r1 WHERE exp_next <= cutoff_ts),
-r2_tbb_raw AS (
-  SELECT e.cohort_week, {dim_cols_trailing(dims, "e")}
-    COUNT(DISTINCT e.customer_email) AS elig_users,
-    COUNT(DISTINCT CASE WHEN sm.CancelAtUtc IS NOT NULL AND TIMESTAMP(sm.CancelAtUtc) < e.exp_next THEN e.customer_email END) AS cancel_users
-  FROM r2_elig e JOIN `eu-andy-marketing-raw.silver_sgw.stg_memberships` sm
-    ON CAST(e.membership_id AS STRING) = CAST(sm.Id AS STRING)
-  GROUP BY ALL
-),
-succ_r2 AS (
-  SELECT cohort_week, {dims_only_trailing}customer_email, membership_id, MIN(t_datetime) AS succ_dt,
-    ANY_VALUE(ms_billing_frequency) AS bf, ANY_VALUE(ms_billing_period) AS bp
-  FROM btx WHERE invoice_r_index='2' AND transaction_status='succeeded' GROUP BY ALL
-),
-succ_next_r2 AS (
-  SELECT *, CASE WHEN bp='weeks' THEN TIMESTAMP_ADD(succ_dt, INTERVAL (CAST(bf AS INT64)*7) DAY)
-                 WHEN bp='months' THEN TIMESTAMP_ADD(succ_dt, INTERVAL (CAST(bf AS INT64)*30) DAY)
-                 ELSE TIMESTAMP_ADD(succ_dt, INTERVAL default_days DAY) END AS exp_next FROM succ_r2
-),
-r3_elig AS (SELECT * FROM succ_next_r2 WHERE exp_next <= cutoff_ts),
-r3_tbb_raw AS (
-  SELECT e.cohort_week, {dim_cols_trailing(dims, "e")}
-    COUNT(DISTINCT e.customer_email) AS elig_users,
-    COUNT(DISTINCT CASE WHEN sm.CancelAtUtc IS NOT NULL AND TIMESTAMP(sm.CancelAtUtc) < e.exp_next THEN e.customer_email END) AS cancel_users
-  FROM r3_elig e JOIN `eu-andy-marketing-raw.silver_sgw.stg_memberships` sm
-    ON CAST(e.membership_id AS STRING) = CAST(sm.Id AS STRING)
-  GROUP BY ALL
-),
-succ_r3 AS (
-  SELECT cohort_week, {dims_only_trailing}customer_email, membership_id, MIN(t_datetime) AS succ_dt,
-    ANY_VALUE(ms_billing_frequency) AS bf, ANY_VALUE(ms_billing_period) AS bp
-  FROM btx WHERE invoice_r_index='3' AND transaction_status='succeeded' GROUP BY ALL
-),
-succ_next_r3 AS (
-  SELECT *, CASE WHEN bp='weeks' THEN TIMESTAMP_ADD(succ_dt, INTERVAL (CAST(bf AS INT64)*7) DAY)
-                 WHEN bp='months' THEN TIMESTAMP_ADD(succ_dt, INTERVAL (CAST(bf AS INT64)*30) DAY)
-                 ELSE TIMESTAMP_ADD(succ_dt, INTERVAL default_days DAY) END AS exp_next FROM succ_r3
-),
-r4_elig AS (SELECT * FROM succ_next_r3 WHERE exp_next <= cutoff_ts),
-r4_tbb_raw AS (
-  SELECT e.cohort_week, {dim_cols_trailing(dims, "e")}
-    COUNT(DISTINCT e.customer_email) AS elig_users,
-    COUNT(DISTINCT CASE WHEN sm.CancelAtUtc IS NOT NULL AND TIMESTAMP(sm.CancelAtUtc) < e.exp_next THEN e.customer_email END) AS cancel_users
-  FROM r4_elig e JOIN `eu-andy-marketing-raw.silver_sgw.stg_memberships` sm
-    ON CAST(e.membership_id AS STRING) = CAST(sm.Id AS STRING)
-  GROUP BY ALL
-),
-rx_stats AS (
+{rx_chain}rx_stats AS (
   SELECT cohort_week, {dims_only_trailing}invoice_r_index,
     COUNT(DISTINCT CASE WHEN t_attempt_index=1 THEN customer_email END) AS first_attempt_users,
     COUNT(DISTINCT CASE WHEN t_attempt_index=1 THEN transaction_id END) AS first_attempt_tx,
@@ -1305,11 +1291,7 @@ FROM weeks w
 LEFT JOIN r0_stats r0 ON r0.cohort_week = w.week_start{dim_on_r0}
 LEFT JOIN r1_tbb_cte r1 ON r1.cohort_week = w.week_start{dim_on_r1}
 LEFT JOIN rx_stats s ON s.cohort_week = w.week_start AND s.invoice_r_index = rx_idx{dim_on_s}
-LEFT JOIN (
-  SELECT cohort_week, {dims_only_trailing}'2' AS rx, elig_users, cancel_users FROM r2_tbb_raw
-  UNION ALL SELECT cohort_week, {dims_only_trailing}'3', elig_users, cancel_users FROM r3_tbb_raw
-  UNION ALL SELECT cohort_week, {dims_only_trailing}'4', elig_users, cancel_users FROM r4_tbb_raw
-) tbb ON tbb.cohort_week = w.week_start AND tbb.rx = rx_idx{dim_on_tbb}
+{tbb_join}
 ORDER BY w.week_start, {dim_cols_trailing(dims, "da") if has_nw else ""}rx_idx
 """
 
@@ -4618,7 +4600,8 @@ def build_ab_table(cohorts, win_start: date, win_end: date) -> pd.DataFrame:
         pool = _ab_pool_sql(pred, win_start, win_end)
         for brand in ("Booking", "Magazine"):
             df = run_query(funnel_sql(brand, {}, [], weeks,
-                                      granularity_override="date_day", cohort_pool_sql=pool))
+                                      granularity_override="date_day", cohort_pool_sql=pool,
+                                      max_rx=2))
             tbl = build_funnel_table(df, brand, [], picked_end=win_end)
             col_dicts[(name, brand)] = {
                 str(r["__key__"]): r.get(("Total",), "") for _, r in tbl.iterrows()
