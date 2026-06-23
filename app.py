@@ -4493,20 +4493,9 @@ _AB_CLIQ_PRODUCT_IDS = "'063a0977-511e-4a14-baaf-d02e60119d7f', '8e3dca5f-7f4d-4
 
 # Chaque cohorte : (psp_group, nom affiché, prédicat SQL sur fm/sm/pr).
 # fm = fact_memberships, sm = stg_memberships (Metadata JSON), pr = stg_prices.
+# NMI + LBP : fenêtre commune AB_WINDOW (08-10). TP est géré à part (2 tests aux
+# dates différentes, voir TP_DD / TP_PREAUTH ci-dessous).
 AB_COHORTS = [
-    ("TP",  "Référence",
-     "fm.ms_default_psp='trustpayment' "
-     "AND COALESCE(JSON_VALUE(sm.Metadata,'$.abPreAuth'),'')!='B' "
-     "AND COALESCE(JSON_VALUE(sm.Metadata,'$.dynamic_descriptor_tp'),'')!='B'"),
-    ("TP",  "Preauth only",
-     "fm.ms_default_psp='trustpayment' AND JSON_VALUE(sm.Metadata,'$.abPreAuth')='B' "
-     "AND COALESCE(JSON_VALUE(sm.Metadata,'$.dynamic_descriptor_tp'),'')!='B'"),
-    ("TP",  "DD only",
-     "fm.ms_default_psp='trustpayment' AND JSON_VALUE(sm.Metadata,'$.dynamic_descriptor_tp')='B' "
-     "AND COALESCE(JSON_VALUE(sm.Metadata,'$.abPreAuth'),'')!='B'"),
-    ("TP",  "Preauth + DD",
-     "fm.ms_default_psp='trustpayment' AND JSON_VALUE(sm.Metadata,'$.abPreAuth')='B' "
-     "AND JSON_VALUE(sm.Metadata,'$.dynamic_descriptor_tp')='B'"),
     ("NMI", "Référence",
      "fm.ms_default_psp='nmi' "
      "AND COALESCE(JSON_VALUE(sm.Metadata,'$.abPreAuth'),'')!='B' "
@@ -4521,8 +4510,26 @@ AB_COHORTS = [
     ("LBP", "Preauth LBP",
      "fm.ms_default_psp='labanquepostale' AND JSON_VALUE(sm.Metadata,'$.abPreAuth')='B'"),
 ]
-AB_PSP_ORDER = ["TP", "NMI", "LBP"]
-AB_PSP_LABELS = {"TP": "TrustPayment", "NMI": "NMI", "LBP": "La Banque Postale"}
+AB_PSP_ORDER = ["NMI", "LBP"]
+AB_PSP_LABELS = {"NMI": "NMI", "LBP": "La Banque Postale"}
+
+# --- TP : 2 tests aux dates distinctes, 1 tableau chacun. La Référence partage
+# la fenêtre de sa cohorte (build_ab_table applique la même fenêtre à toutes les
+# colonnes). « Preauth + DD » supprimé.
+TP_DD_WIN = (date(2026, 6, 8), date(2026, 6, 14))
+TP_PREAUTH_WIN = (date(2026, 6, 16), date.today())
+TP_DD_COHORTS = [
+    ("Référence", "fm.ms_default_psp='trustpayment' "
+     "AND COALESCE(JSON_VALUE(sm.Metadata,'$.dynamic_descriptor_tp'),'')!='B'"),
+    ("DD TP", "fm.ms_default_psp='trustpayment' "
+     "AND JSON_VALUE(sm.Metadata,'$.dynamic_descriptor_tp')='B'"),
+]
+TP_PREAUTH_COHORTS = [
+    ("Référence", "fm.ms_default_psp='trustpayment' "
+     "AND COALESCE(JSON_VALUE(sm.Metadata,'$.abPreAuth'),'')!='B'"),
+    ("Pre Auth TP", "fm.ms_default_psp='trustpayment' "
+     "AND JSON_VALUE(sm.Metadata,'$.abPreAuth')='B'"),
+]
 
 # --- Test NMI Processor (lancé le 16/06 18h Paris) : EMS / New Kadima / Old Kadima ---
 # Identifié par membership.metadata.abNmiProcessor (A/B/C). ATTENTION : ce flag
@@ -4680,10 +4687,9 @@ WITH cohort_bk AS (
   FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm
   JOIN `eu-andy-marketing-raw.silver_sgw.stg_memberships` sm
     ON CAST(fm.membership_id AS STRING) = CAST(sm.Id AS STRING)
-  WHERE DATE(sm.CreatedAtUtc) BETWEEN '{AB_WINDOW_START.isoformat()}' AND '{AB_WINDOW_END.isoformat()}'
+  WHERE DATE(sm.CreatedAtUtc) BETWEEN '{TP_DD_WIN[0].isoformat()}' AND '{TP_DD_WIN[1].isoformat()}'
     AND fm.brand_type='Booking' AND fm.ms_default_psp='trustpayment'
     AND JSON_VALUE(sm.Metadata,'$.dynamic_descriptor_tp')='B'
-    AND COALESCE(JSON_VALUE(sm.Metadata,'$.abPreAuth'),'')!='B'
     AND fm.ms_status NOT IN ('abandonned','processing','paused')
 ),
 cohort_mag AS (
@@ -4691,7 +4697,7 @@ cohort_mag AS (
   FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm
   JOIN `eu-andy-marketing-raw.silver_sgw.stg_memberships` sm
     ON CAST(fm.membership_id AS STRING) = CAST(sm.Id AS STRING)
-  WHERE DATE(sm.CreatedAtUtc) BETWEEN '{AB_WINDOW_START.isoformat()}' AND '{AB_WINDOW_END.isoformat()}'
+  WHERE DATE(sm.CreatedAtUtc) BETWEEN '{TP_DD_WIN[0].isoformat()}' AND '{TP_DD_WIN[1].isoformat()}'
     AND fm.brand_type='Magazine' AND fm.ms_status NOT IN ('abandonned','processing','paused')
     AND fm.customer_id IN (SELECT customer_id FROM cohort_bk)
 )
@@ -4861,18 +4867,39 @@ elif page == "VAMP Date":
 
 elif page == "Analyse A/B":
     st.caption(
-        f"Analyse A/B — cohortes figées (signup {AB_WINDOW_START.strftime('%d/%m')} → "
-        f"{AB_WINDOW_END.strftime('%d/%m/%Y')}). Indépendant de la sidebar. "
-        "**Seule la section choisie se charge** (pour aller vite)."
+        "Analyse A/B — cohortes figées, fenêtres propres à chaque test. "
+        "Indépendant de la sidebar. **Seule la section choisie se charge** (pour aller vite)."
     )
     # Sous-navigation : on ne lance QUE les requêtes de la section sélectionnée
     # (avant : tout se chargeait d'un coup → ~25 requêtes funnel = très lent).
-    _AB_SECTIONS = ["TrustPayment", "NMI", "La Banque Postale", "Focus DD TP", "Test NMI Processor"]
+    _AB_SECTIONS = ["TP — DD", "TP — Pre Auth", "NMI", "La Banque Postale",
+                    "Focus DD TP", "Test NMI Processor"]
     _ab_sel = st.radio("Section", _AB_SECTIONS, horizontal=True, key="ab_section",
                        label_visibility="collapsed")
 
-    if _ab_sel in ("TrustPayment", "NMI", "La Banque Postale"):
-        _psp = {"TrustPayment": "TP", "NMI": "NMI", "La Banque Postale": "LBP"}[_ab_sel]
+    if _ab_sel in ("TP — DD", "TP — Pre Auth"):
+        if _ab_sel == "TP — DD":
+            _cohorts, _win, _grp = TP_DD_COHORTS, TP_DD_WIN, "DD TP"
+        else:
+            _cohorts, _win, _grp = TP_PREAUTH_COHORTS, TP_PREAUTH_WIN, "Pre Auth TP"
+        st.subheader(f"TrustPayment — {_grp}")
+        st.caption(f"Fenêtre signup {_win[0].strftime('%d/%m')} → {_win[1].strftime('%d/%m')}. "
+                   "Référence = même fenêtre, variante A du test.")
+        with st.spinner(f"{_ab_sel}…"):
+            try:
+                _mat = run_query(ab_maturity_sql(
+                    [(_grp, n, p) for n, p in _cohorts], _win[0], _win[1]))
+                st.markdown(render_ab_maturity(_mat, _grp), unsafe_allow_html=True)
+            except Exception as e:
+                st.error(f"Erreur maturité {_grp} : {e}")
+            try:
+                _tp_tbl = build_ab_table(_cohorts, _win[0], _win[1])
+                st.markdown(render_table_html(_tp_tbl), unsafe_allow_html=True)
+            except Exception as e:
+                st.error(f"Erreur table {_grp} : {e}")
+
+    elif _ab_sel in ("NMI", "La Banque Postale"):
+        _psp = {"NMI": "NMI", "La Banque Postale": "LBP"}[_ab_sel]
         with st.spinner(f"{_ab_sel}…"):
             try:
                 df_mat = run_query(ab_maturity_sql())
