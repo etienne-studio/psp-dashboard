@@ -4571,6 +4571,34 @@ def _ab_pool_sql(predicate: str, win_start: date = AB_WINDOW_START,
     )
 
 
+def _ab_test_dates_subquery(test_preds: list, win_start: date, win_end: date) -> str:
+    """Sous-requête : dates de signup (Booking) où AU MOINS une cohorte de test
+    existe, dans la fenêtre. Sert à caler la Référence sur la plage réelle du test."""
+    ors = " OR ".join(f"({p})" for p in test_preds)
+    return (
+        "SELECT DISTINCT DATE(sm.CreatedAtUtc)\n"
+        "      FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm\n"
+        "      JOIN `eu-andy-marketing-raw.silver_sgw.stg_memberships` sm ON CAST(fm.membership_id AS STRING)=CAST(sm.Id AS STRING)\n"
+        "      LEFT JOIN `eu-andy-marketing-raw.silver_sgw.stg_prices` pr ON CAST(fm.price_id AS STRING)=CAST(pr.Id AS STRING)\n"
+        f"      WHERE DATE(sm.CreatedAtUtc) BETWEEN '{win_start.isoformat()}' AND '{win_end.isoformat()}'\n"
+        f"        AND fm.brand_type='Booking' AND ({ors})"
+    )
+
+
+def _ab_mirror_cohorts(cohorts: list, win_start: date, win_end: date) -> list:
+    """Restreint la 1re cohorte (= Référence) aux DATES de signup des cohortes de
+    test (les suivantes), pour que la Référence couvre la même plage que le test
+    qu'elle accompagne (cf. demande : 'la référence doit avoir la même plage de
+    date que la cohorte d'en face'). Les cohortes de test gardent leur prédicat."""
+    if len(cohorts) < 2:
+        return list(cohorts)
+    ref_name, ref_pred = cohorts[0]
+    tests = [p for _, p in cohorts[1:]]
+    sub = _ab_test_dates_subquery(tests, win_start, win_end)
+    mirrored = f"({ref_pred}) AND DATE(sm.CreatedAtUtc) IN (\n      {sub}\n    )"
+    return [(ref_name, mirrored)] + list(cohorts[1:])
+
+
 def _ab_weeks(win_start: date, win_end: date):
     """Jours de la fenêtre signup ± 1 jour de marge (écart minuit customer vs
     membership). Le pool customer définit la vraie cohorte ; dims=[] => 1 colonne."""
@@ -4582,10 +4610,23 @@ def _ab_weeks(win_start: date, win_end: date):
 
 
 def ab_maturity_sql(cohorts=AB_COHORTS, win_start: date = AB_WINDOW_START,
-                    win_end: date = AB_WINDOW_END) -> str:
+                    win_end: date = AB_WINDOW_END, mirror: bool = True) -> str:
     """Par cohorte : jours écoulés entre la veille minuit et le dernier R0 créé
     (= dernier signup Booking de la cohorte), + nb de users. cohorts = liste de
-    (group, name, predicate)."""
+    (group, name, predicate). mirror=True : la Référence de chaque groupe est
+    restreinte aux dates de signup de ses cohortes de test (même plage)."""
+    if mirror:
+        by_g, order = {}, []
+        for psp, name, pred in cohorts:
+            if psp not in by_g:
+                by_g[psp] = []
+                order.append(psp)
+            by_g[psp].append((name, pred))
+        cohorts = [
+            (psp, n, p)
+            for psp in order
+            for (n, p) in _ab_mirror_cohorts(by_g[psp], win_start, win_end)
+        ]
     parts = []
     for psp, name, pred in cohorts:
         parts.append(
@@ -4604,10 +4645,14 @@ def ab_maturity_sql(cohorts=AB_COHORTS, win_start: date = AB_WINDOW_START,
     return "\nUNION ALL\n".join(parts)
 
 
-def build_ab_table(cohorts, win_start: date, win_end: date) -> pd.DataFrame:
+def build_ab_table(cohorts, win_start: date, win_end: date,
+                   mirror: bool = True) -> pd.DataFrame:
     """Table combinée : lignes = KPI funnel R0→R4, colonnes = (cohorte ×
     {Booking, Magazine}). cohorts = liste de (name, predicate). Réutilise
-    build_funnel_table -> calculs identiques au funnel."""
+    build_funnel_table -> calculs identiques au funnel. mirror=True : la 1re
+    cohorte (Référence) est restreinte aux dates de signup des cohortes de test."""
+    if mirror:
+        cohorts = _ab_mirror_cohorts(cohorts, win_start, win_end)
     weeks = _ab_weeks(win_start, win_end)
     groups = [(name, brand) for (name, _pred) in cohorts for brand in ("Booking", "Magazine")]
     col_dicts: dict = {}
@@ -4890,7 +4935,7 @@ elif page == "Analyse A/B":
             _cohorts, _win, _grp = TP_PREAUTH_COHORTS, TP_PREAUTH_WIN, "Pre Auth TP"
         st.subheader(f"TrustPayment — {_grp}")
         st.caption(f"Fenêtre signup {_win[0].strftime('%d/%m')} → {_win[1].strftime('%d/%m')}. "
-                   "Référence = même fenêtre, variante A du test.")
+                   "Référence restreinte aux dates de signup réelles du test (même plage).")
         with st.spinner(f"{_ab_sel}…"):
             try:
                 _mat = run_query(ab_maturity_sql(
@@ -4945,9 +4990,10 @@ elif page == "Analyse A/B":
             try:
                 _np_mat = run_query(ab_maturity_sql(
                     [("NMI Proc", n, p) for n, p in NMIPROC_COHORTS],
-                    NMIPROC_WINDOW_START, NMIPROC_WINDOW_END))
+                    NMIPROC_WINDOW_START, NMIPROC_WINDOW_END, mirror=False))
                 st.markdown(render_ab_maturity(_np_mat, "NMI Proc"), unsafe_allow_html=True)
-                _np_tbl = build_ab_table(NMIPROC_COHORTS, NMIPROC_WINDOW_START, NMIPROC_WINDOW_END)
+                _np_tbl = build_ab_table(NMIPROC_COHORTS, NMIPROC_WINDOW_START,
+                                         NMIPROC_WINDOW_END, mirror=False)
                 st.markdown(render_table_html(_np_tbl), unsafe_allow_html=True)
             except Exception as e:
                 st.error(f"Erreur Test NMI Processor : {e}")
