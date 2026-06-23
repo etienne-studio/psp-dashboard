@@ -1053,7 +1053,7 @@ def brand_psp_join(alias: str, dims: list, filters: dict) -> str:
 # ---------------------------------------------------------------------------
 def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date] = None,
                granularity_override: str = None, cohort_pool_sql: str = None,
-               max_rx: int = 4) -> str:
+               max_rx: int = 4, cohort_map_sql: str = None) -> str:
     # max_rx (2..4) : plafonne le calcul du funnel à R{max_rx}. Par défaut 4
     # (R0→R4, comportement inchangé pour les onglets Funnel). L'analyse A/B passe
     # à 2 (cohortes fraîches : R3/R4 toujours vides) -> supprime 2 grosses
@@ -1092,15 +1092,30 @@ def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date
     bpsp_cte = brand_psp_cte(dims, filters)
     bpsp_join_fm = brand_psp_join("fm", dims, filters)
     bpsp_join_ft = brand_psp_join("ft", dims, filters)
-    # Cohorte A/B : INNER JOIN sur la whitelist de customers (si fournie).
-    cohort_join_fm = (
-        f"  INNER JOIN (\n{cohort_pool_sql}\n  ) cohort_pool ON cohort_pool.customer_id = fm.customer_id"
-        if cohort_pool_sql else ""
+    # Cohorte A/B : deux modes.
+    #  - cohort_pool_sql : whitelist `customer_id` -> INNER JOIN (1 requête / cohorte).
+    #  - cohort_map_sql  : (customer_id, cohort) -> 1 SEULE requête pour toutes les
+    #    cohortes d'un tableau, la cohorte devient une dimension (RAW:cmap.cohort).
+    #    Sémantique IDENTIQUE au pool (jointure customer-level) mais 2 requêtes au
+    #    lieu de 2×N. Le dim est calculé dans bm puis propagé via elig_users -> btx.
+    cohort_map_cte = (
+        f",\ncohort_map AS (\n{cohort_map_sql}\n)" if cohort_map_sql else ""
     )
-    cohort_join_ft = (
-        f"  INNER JOIN (\n{cohort_pool_sql}\n  ) cohort_pool ON cohort_pool.customer_id = ft.customer_id"
-        if cohort_pool_sql else ""
-    )
+    if cohort_map_sql:
+        cohort_join_fm = "  INNER JOIN cohort_map cmap ON cmap.customer_id = fm.customer_id"
+        cohort_join_ft = (
+            "  INNER JOIN (SELECT DISTINCT customer_id FROM cohort_map) cohort_pool "
+            "ON cohort_pool.customer_id = ft.customer_id"
+        )
+    else:
+        cohort_join_fm = (
+            f"  INNER JOIN (\n{cohort_pool_sql}\n  ) cohort_pool ON cohort_pool.customer_id = fm.customer_id"
+            if cohort_pool_sql else ""
+        )
+        cohort_join_ft = (
+            f"  INNER JOIN (\n{cohort_pool_sql}\n  ) cohort_pool ON cohort_pool.customer_id = ft.customer_id"
+            if cohort_pool_sql else ""
+        )
     # Row-level filters (PSP / Verticale / Conciergerie / Devise / Marché Booking)
     # — applied directly in WHERE of bm and bt so non-matching rows are excluded.
     fm_filter = row_level_filter_clause("fm", filters)
@@ -1173,7 +1188,7 @@ def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date
     return f"""
 DECLARE cutoff_ts TIMESTAMP DEFAULT TIMESTAMP(CURRENT_DATE());
 DECLARE default_days INT64 DEFAULT {default_days};
-{weeks_cte}{cp_cte}{cp_price_cte}{bpsp_cte},
+{weeks_cte}{cp_cte}{cp_price_cte}{bpsp_cte}{cohort_map_cte},
 bm AS (
   SELECT
     DATE_TRUNC(DATE(c.CreatedAtUtc), {trunc_arg}) AS cohort_week,
@@ -4596,15 +4611,23 @@ def build_ab_table(cohorts, win_start: date, win_end: date) -> pd.DataFrame:
     weeks = _ab_weeks(win_start, win_end)
     groups = [(name, brand) for (name, _pred) in cohorts for brand in ("Booking", "Magazine")]
     col_dicts: dict = {}
+    # cohort_map = même pools (customer-level) + label cohorte, en UNION ALL.
+    # => 1 requête funnel par brand (au lieu de 2×N), sémantique identique.
+    cmap_parts = []
     for name, pred in cohorts:
         pool = _ab_pool_sql(pred, win_start, win_end)
-        for brand in ("Booking", "Magazine"):
-            df = run_query(funnel_sql(brand, {}, [], weeks,
-                                      granularity_override="date_day", cohort_pool_sql=pool,
-                                      max_rx=2))
-            tbl = build_funnel_table(df, brand, [], picked_end=win_end)
+        safe = name.replace("'", "''")
+        cmap_parts.append(f"    SELECT customer_id, '{safe}' AS cohort FROM (\n{pool}\n    ) _cp_{len(cmap_parts)}")
+    cohort_map_sql = "\n    UNION ALL\n".join(cmap_parts)
+    cohort_dim = ("cohort", "Cohorte", "RAW:cmap.cohort", "RAW:cmap.cohort")
+    for brand in ("Booking", "Magazine"):
+        df = run_query(funnel_sql(brand, {}, [cohort_dim], weeks,
+                                  granularity_override="date_day",
+                                  cohort_map_sql=cohort_map_sql, max_rx=2))
+        tbl = build_funnel_table(df, brand, [cohort_dim], picked_end=win_end)
+        for name, _pred in cohorts:
             col_dicts[(name, brand)] = {
-                str(r["__key__"]): r.get(("Total",), "") for _, r in tbl.iterrows()
+                str(r["__key__"]): r.get((name,), "") for _, r in tbl.iterrows()
             }
 
     rows = []
