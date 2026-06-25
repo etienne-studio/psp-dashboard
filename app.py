@@ -4484,27 +4484,28 @@ if _needs_controls:
 # Booking + Magazine. Réutilise funnel_sql + build_funnel_table (mêmes calculs).
 #
 # Pour éditer l'analyse : modifier AB_WINDOW + AB_COHORTS ci-dessous, puis push.
-AB_WINDOW_START = date(2026, 6, 8)   # createdAt membership >= (signup)
-AB_WINDOW_END   = date(2026, 6, 10)  # createdAt membership <=
-_AB_CLIQ_PRODUCT_IDS = "'063a0977-511e-4a14-baaf-d02e60119d7f', '8e3dca5f-7f4d-4ada-b472-b8e5dcae0565'"
+# AB_WINDOW : valeurs par défaut des helpers (les onglets utilisent leur propre
+# fenêtre : NMI_WINDOW, LBP_WINDOW, TP_*_WIN, NMIPROC_WINDOW).
+AB_WINDOW_START = date(2026, 6, 16)
+AB_WINDOW_END   = date(2026, 6, 21)
 
-# Chaque cohorte : (psp_group, nom affiché, prédicat SQL sur fm/sm/pr).
-# fm = fact_memberships, sm = stg_memberships (Metadata JSON), pr = stg_prices.
-# NMI + LBP : fenêtre commune AB_WINDOW (08-10). TP est géré à part (2 tests aux
-# dates différentes, voir TP_DD / TP_PREAUTH ci-dessous).
-AB_COHORTS = [
-    ("NMI", "Référence",
-     "fm.ms_default_psp='nmi' "
-     "AND COALESCE(JSON_VALUE(sm.Metadata,'$.abPreAuth'),'')!='B' "
-     f"AND COALESCE(CAST(pr.ProductId AS STRING),'') NOT IN ({_AB_CLIQ_PRODUCT_IDS})"),
-    ("NMI", "Cliq",
-     f"fm.ms_default_psp='nmi' AND CAST(pr.ProductId AS STRING) IN ({_AB_CLIQ_PRODUCT_IDS})"),
-    ("NMI", "Preauth NMI",
-     "fm.ms_default_psp='nmi' AND JSON_VALUE(sm.Metadata,'$.abPreAuth')='B' "
-     f"AND COALESCE(CAST(pr.ProductId AS STRING),'') NOT IN ({_AB_CLIQ_PRODUCT_IDS})"),
+# --- NMI : 1 colonne par processeur réel (MidId du R0 derrière la gateway NMI).
+# Référentiel MidId (cf. doc Notion + _brand_psp_concat). New/Old Kadima séparés
+# par MidId, confirmé par le flag abNmiProcessor ('new_kadima' -> f6130732 ;
+# 'old_kadima' -> 5f915cec). Pas de Référence -> mirror=False. Fenêtre 16 → 21
+# (plage où Old & New Kadima coexistent ; arrêt au 21 pour maturité propre).
+NMI_WINDOW = (date(2026, 6, 16), date(2026, 6, 21))
+_NMI_MIDS = [
+    ("NMI EMS",        "688b5f4e-4f33-4b16-b2c7-6c601ba15306"),
+    ("NMI Cliq",       "4a7af99e-20b3-48b3-8e93-6fc39f8012b0"),
+    ("NMI CASH",       "9cf8e38c-c719-4d33-a1e3-aaa72cf88cdd"),
+    ("NMI New Kadima", "f6130732-c577-4d1d-9ab9-802900b478a0"),
+    ("NMI Old Kadima", "5f915cec-f0b3-40e9-9908-b3590b791448"),
 ]
-AB_PSP_ORDER = ["NMI"]
-AB_PSP_LABELS = {"NMI": "NMI"}
+NMI_COHORTS = [
+    (name, f"fm.ms_default_psp='nmi' AND rmid.MidId='{mid}'")
+    for name, mid in _NMI_MIDS
+]
 
 # --- La Banque Postale (psp = labanquepostale) : 1 colonne par conciergerie.
 # Pas de test A/B ici, juste une répartition par brand -> pas de Référence ni de
@@ -4563,10 +4564,24 @@ NMIPROC_COHORTS = [
 ]
 
 
+def _ab_r0_mid_join(win_start: date, win_end: date) -> str:
+    """LEFT JOIN donnant le MidId du R0 (processeur réel derrière NMI) par
+    membership. Ajouté seulement si le prédicat référence `rmid.` (cohortes NMI
+    par processeur : EMS / Cliq / CASH / Kadima). Borné ±5 j autour de la fenêtre."""
+    sub = _r0_mid_subquery(
+        f"AND f.t_date BETWEEN DATE_SUB('{win_start.isoformat()}', INTERVAL 5 DAY) "
+        f"AND DATE_ADD('{win_end.isoformat()}', INTERVAL 5 DAY)"
+    )
+    return (
+        "    LEFT JOIN (\n    " + sub + "\n    ) rmid ON rmid.membership_id = fm.membership_id\n"
+    )
+
+
 def _ab_pool_sql(predicate: str, win_start: date = AB_WINDOW_START,
                  win_end: date = AB_WINDOW_END) -> str:
     """Subquery renvoyant les customer_id de la cohorte (membership Booking
     matchant le prédicat, signup dans la fenêtre). Injecté dans funnel_sql."""
+    r0_mid = _ab_r0_mid_join(win_start, win_end) if "rmid." in predicate else ""
     return (
         "    SELECT DISTINCT fm.customer_id\n"
         "    FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm\n"
@@ -4574,6 +4589,7 @@ def _ab_pool_sql(predicate: str, win_start: date = AB_WINDOW_START,
         "      ON CAST(fm.membership_id AS STRING) = CAST(sm.Id AS STRING)\n"
         "    LEFT JOIN `eu-andy-marketing-raw.silver_sgw.stg_prices` pr\n"
         "      ON CAST(fm.price_id AS STRING) = CAST(pr.Id AS STRING)\n"
+        f"{r0_mid}"
         f"    WHERE DATE(sm.CreatedAtUtc) BETWEEN '{win_start.isoformat()}' AND '{win_end.isoformat()}'\n"
         "      AND fm.brand_type = 'Booking'\n"
         f"      AND ({predicate})"
@@ -4618,7 +4634,7 @@ def _ab_weeks(win_start: date, win_end: date):
     )
 
 
-def ab_maturity_sql(cohorts=AB_COHORTS, win_start: date = AB_WINDOW_START,
+def ab_maturity_sql(cohorts=(), win_start: date = AB_WINDOW_START,
                     win_end: date = AB_WINDOW_END, mirror: bool = True) -> str:
     """Par cohorte : jours écoulés entre la veille minuit et le dernier R0 créé
     (= dernier signup Booking de la cohorte), + nb de users. cohorts = liste de
@@ -4638,6 +4654,7 @@ def ab_maturity_sql(cohorts=AB_COHORTS, win_start: date = AB_WINDOW_START,
         ]
     parts = []
     for psp, name, pred in cohorts:
+        r0_mid = _ab_r0_mid_join(win_start, win_end) if "rmid." in pred else ""
         parts.append(
             f"SELECT '{psp}' AS psp, '{name}' AS cohort,\n"
             "  DATE_DIFF(DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY), DATE(MAX(sm.CreatedAtUtc)), DAY) AS days_elapsed,\n"
@@ -4648,6 +4665,7 @@ def ab_maturity_sql(cohorts=AB_COHORTS, win_start: date = AB_WINDOW_START,
             "  ON CAST(fm.membership_id AS STRING) = CAST(sm.Id AS STRING)\n"
             "LEFT JOIN `eu-andy-marketing-raw.silver_sgw.stg_prices` pr\n"
             "  ON CAST(fm.price_id AS STRING) = CAST(pr.Id AS STRING)\n"
+            f"{r0_mid}"
             f"WHERE DATE(sm.CreatedAtUtc) BETWEEN '{win_start.isoformat()}' AND '{win_end.isoformat()}'\n"
             f"  AND fm.brand_type='Booking' AND ({pred})"
         )
@@ -4699,11 +4717,6 @@ def build_ab_table(cohorts, win_start: date, win_end: date,
     out.attrs["dims"] = [("cohort", "Cohorte", "", ""), ("brand", "Abo", "", "")]
     out.attrs["groups"] = groups
     return out
-
-
-def build_ab_psp_table(psp_group: str) -> pd.DataFrame:
-    cohorts = [(n, p) for (g, n, p) in AB_COHORTS if g == psp_group]
-    return build_ab_table(cohorts, AB_WINDOW_START, AB_WINDOW_END)
 
 
 def render_ab_maturity(df_mat: pd.DataFrame, psp_group: str) -> str:
@@ -4959,19 +4972,24 @@ elif page == "Analyse A/B":
                 st.error(f"Erreur table {_grp} : {e}")
 
     elif _ab_sel == "NMI":
+        st.subheader("NMI — par processeur réel (MidId du R0)")
+        st.caption(f"Fenêtre signup {NMI_WINDOW[0].strftime('%d/%m')} → "
+                   f"{NMI_WINDOW[1].strftime('%d/%m')}. 1 colonne par processeur derrière "
+                   "la gateway NMI (EMS / Cliq / CASH / New Kadima / Old Kadima).")
         with st.spinner("NMI…"):
             try:
-                df_mat = run_query(ab_maturity_sql())
+                _nmi_mat = run_query(ab_maturity_sql(
+                    [("NMI", n, p) for n, p in NMI_COHORTS],
+                    NMI_WINDOW[0], NMI_WINDOW[1], mirror=False))
+                st.markdown(render_ab_maturity(_nmi_mat, "NMI"), unsafe_allow_html=True)
             except Exception as e:
-                st.error(f"Erreur maturité A/B : {e}")
-                df_mat = pd.DataFrame(columns=["psp", "cohort", "days_elapsed", "last_r0", "users"])
-            st.subheader("NMI")
-            st.markdown(render_ab_maturity(df_mat, "NMI"), unsafe_allow_html=True)
+                st.error(f"Erreur maturité NMI : {e}")
             try:
-                _ab_tbl = build_ab_psp_table("NMI")
-                st.markdown(render_table_html(_ab_tbl), unsafe_allow_html=True)
+                _nmi_tbl = build_ab_table(NMI_COHORTS, NMI_WINDOW[0], NMI_WINDOW[1],
+                                          mirror=False)
+                st.markdown(render_table_html(_nmi_tbl), unsafe_allow_html=True)
             except Exception as e:
-                st.error(f"Erreur table A/B NMI : {e}")
+                st.error(f"Erreur table NMI : {e}")
 
     elif _ab_sel == "La Banque Postale":
         st.subheader("La Banque Postale")
