@@ -4483,9 +4483,8 @@ if _needs_controls:
 # (KPI R0→R4 identiques aux onglets Funnel) pour chaque cohorte, en colonnes
 # Booking + Magazine. Réutilise funnel_sql + build_funnel_table (mêmes calculs).
 #
-# Pour éditer l'analyse : modifier AB_WINDOW + AB_COHORTS ci-dessous, puis push.
-# AB_WINDOW : valeurs par défaut des helpers (les onglets utilisent leur propre
-# fenêtre : NMI_WINDOW, LBP_WINDOW, TP_*_WIN, NMIPROC_WINDOW).
+# AB_WINDOW : valeurs par défaut des helpers (chaque onglet utilise sa propre
+# fenêtre : NMI_WINDOW, LBP_WINDOW, TP_DD_WIN, TP_PREAUTH_WIN).
 AB_WINDOW_START = date(2026, 6, 16)
 AB_WINDOW_END   = date(2026, 6, 21)
 
@@ -4537,32 +4536,6 @@ TP_PREAUTH_COHORTS = [
     ("Pre Auth TP", "fm.ms_default_psp='trustpayment' "
      "AND JSON_VALUE(sm.Metadata,'$.abPreAuth')='B'"),
 ]
-
-# --- Test NMI Processor (lancé le 16/06 18h Paris) : EMS / New Kadima / Old Kadima ---
-# Identifié par membership.metadata.abNmiProcessor (A/B/C). ATTENTION : ce flag
-# est posé GLOBALEMENT sur tous les signups (toutes conciergeries), mais le
-# routage EMS/Kadima ne concerne que le NMI (Rezaflash) -> on filtre psp=nmi
-# pour ne pas polluer avec TP/Pixxles. Cutoff précis à 18h Paris (CreatedAtParis).
-NMIPROC_WINDOW_START = date(2026, 6, 16)
-NMIPROC_WINDOW_END = date.today()
-# Périmètre du test : NMI (Rezaflash), depuis le 16/06 18h Paris, et UNIQUEMENT
-# les deux prices "Conciergerie 6999" (Privilege exclu — partagé hors test).
-# 50470e1c = 6999 sur produit Rezaflash (A/B) ; b06a8912 = 6999 sur produit
-# Rezaflash-Kadima (C).
-_NMIPROC_PRICE_IDS = (
-    "'50470e1c-e90d-4a4a-90c1-7474a57787c0', 'b06a8912-f5b6-4b62-9c00-802a10789f70'"
-)
-_NMIPROC_SCOPE = (
-    "fm.ms_default_psp='nmi' "
-    "AND sm.CreatedAtParis >= '2026-06-16 18:00:00' "
-    f"AND sm.PriceId IN ({_NMIPROC_PRICE_IDS})"
-)
-NMIPROC_COHORTS = [
-    ("EMS (A)",        f"{_NMIPROC_SCOPE} AND JSON_VALUE(sm.Metadata,'$.abNmiProcessor')='A'"),
-    ("New Kadima (B)", f"{_NMIPROC_SCOPE} AND JSON_VALUE(sm.Metadata,'$.abNmiProcessor')='B'"),
-    ("Old Kadima (C)", f"{_NMIPROC_SCOPE} AND JSON_VALUE(sm.Metadata,'$.abNmiProcessor')='C'"),
-]
-
 
 def _ab_r0_mid_join(win_start: date, win_end: date) -> str:
     """LEFT JOIN donnant le MidId du R0 (processeur réel derrière NMI) par
@@ -4946,7 +4919,7 @@ elif page == "Analyse A/B":
     # Sous-navigation : on ne lance QUE les requêtes de la section sélectionnée
     # (avant : tout se chargeait d'un coup → ~25 requêtes funnel = très lent).
     _AB_SECTIONS = ["TP — DD", "TP — Pre Auth", "NMI", "La Banque Postale",
-                    "Focus DD TP", "Test NMI Processor"]
+                    "Focus DD TP"]
     _ab_sel = st.radio("Section", _AB_SECTIONS, horizontal=True, key="ab_section",
                        label_visibility="collapsed")
 
@@ -5024,22 +4997,3 @@ elif page == "Analyse A/B":
                 st.markdown(render_dd_tp_matrix(_dd), unsafe_allow_html=True)
             except Exception as e:
                 st.error(f"Erreur Focus DD TP : {e}")
-
-    elif _ab_sel == "Test NMI Processor":
-        st.subheader("Test NMI Processor — EMS / New Kadima / Old Kadima")
-        st.caption(
-            "Flag `abNmiProcessor` (A = EMS, B = New Kadima, C = Old Kadima), "
-            "scopé NMI / Rezaflash + plan 6999 uniquement (Privilege exclu). "
-            "Depuis le 16/06 18h Paris → aujourd'hui (glissante)."
-        )
-        with st.spinner("Test NMI Processor…"):
-            try:
-                _np_mat = run_query(ab_maturity_sql(
-                    [("NMI Proc", n, p) for n, p in NMIPROC_COHORTS],
-                    NMIPROC_WINDOW_START, NMIPROC_WINDOW_END, mirror=False))
-                st.markdown(render_ab_maturity(_np_mat, "NMI Proc"), unsafe_allow_html=True)
-                _np_tbl = build_ab_table(NMIPROC_COHORTS, NMIPROC_WINDOW_START,
-                                         NMIPROC_WINDOW_END, mirror=False)
-                st.markdown(render_table_html(_np_tbl), unsafe_allow_html=True)
-            except Exception as e:
-                st.error(f"Erreur Test NMI Processor : {e}")
