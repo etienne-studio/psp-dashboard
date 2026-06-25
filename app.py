@@ -4502,13 +4502,22 @@ AB_COHORTS = [
     ("NMI", "Preauth NMI",
      "fm.ms_default_psp='nmi' AND JSON_VALUE(sm.Metadata,'$.abPreAuth')='B' "
      f"AND COALESCE(CAST(pr.ProductId AS STRING),'') NOT IN ({_AB_CLIQ_PRODUCT_IDS})"),
-    ("LBP", "LBP only",
-     "fm.ms_default_psp='labanquepostale' AND COALESCE(JSON_VALUE(sm.Metadata,'$.abPreAuth'),'')!='B'"),
-    ("LBP", "Preauth LBP",
-     "fm.ms_default_psp='labanquepostale' AND JSON_VALUE(sm.Metadata,'$.abPreAuth')='B'"),
 ]
-AB_PSP_ORDER = ["NMI", "LBP"]
-AB_PSP_LABELS = {"NMI": "NMI", "LBP": "La Banque Postale"}
+AB_PSP_ORDER = ["NMI"]
+AB_PSP_LABELS = {"NMI": "NMI"}
+
+# --- La Banque Postale (psp = labanquepostale) : 1 colonne par conciergerie.
+# Pas de test A/B ici, juste une répartition par brand -> pas de Référence ni de
+# mirror (mirror=False). Fenêtre signup 09 → 21/06.
+LBP_WINDOW = (date(2026, 6, 9), date(2026, 6, 21))
+def _lbp_pred(conc: str) -> str:
+    return (f"fm.ms_default_psp='labanquepostale' "
+            f"AND LOWER(TRIM(SPLIT(COALESCE(fm.brand,''),' - ')[OFFSET(0)]))='{conc}'")
+LBP_COHORTS = [
+    ("RapidOxy LBP", _lbp_pred("rapidoxy")),
+    ("Jumpaide LBP", _lbp_pred("jumpaide.com")),
+    ("Concimax LBP", _lbp_pred("concimax")),
+]
 
 # --- TP : 2 tests aux dates distinctes, 1 tableau chacun. La Référence partage
 # la fenêtre de sa cohorte (build_ab_table applique la même fenêtre à toutes les
@@ -4949,21 +4958,40 @@ elif page == "Analyse A/B":
             except Exception as e:
                 st.error(f"Erreur table {_grp} : {e}")
 
-    elif _ab_sel in ("NMI", "La Banque Postale"):
-        _psp = {"NMI": "NMI", "La Banque Postale": "LBP"}[_ab_sel]
-        with st.spinner(f"{_ab_sel}…"):
+    elif _ab_sel == "NMI":
+        with st.spinner("NMI…"):
             try:
                 df_mat = run_query(ab_maturity_sql())
             except Exception as e:
                 st.error(f"Erreur maturité A/B : {e}")
                 df_mat = pd.DataFrame(columns=["psp", "cohort", "days_elapsed", "last_r0", "users"])
-            st.subheader(AB_PSP_LABELS.get(_psp, _psp))
-            st.markdown(render_ab_maturity(df_mat, _psp), unsafe_allow_html=True)
+            st.subheader("NMI")
+            st.markdown(render_ab_maturity(df_mat, "NMI"), unsafe_allow_html=True)
             try:
-                _ab_tbl = build_ab_psp_table(_psp)
+                _ab_tbl = build_ab_psp_table("NMI")
                 st.markdown(render_table_html(_ab_tbl), unsafe_allow_html=True)
             except Exception as e:
-                st.error(f"Erreur table A/B {_psp} : {e}")
+                st.error(f"Erreur table A/B NMI : {e}")
+
+    elif _ab_sel == "La Banque Postale":
+        st.subheader("La Banque Postale")
+        st.caption(f"Fenêtre signup {LBP_WINDOW[0].strftime('%d/%m')} → "
+                   f"{LBP_WINDOW[1].strftime('%d/%m')}. 1 colonne par conciergerie "
+                   "(psp = labanquepostale).")
+        with st.spinner("La Banque Postale…"):
+            try:
+                _lbp_mat = run_query(ab_maturity_sql(
+                    [("LBP", n, p) for n, p in LBP_COHORTS],
+                    LBP_WINDOW[0], LBP_WINDOW[1], mirror=False))
+                st.markdown(render_ab_maturity(_lbp_mat, "LBP"), unsafe_allow_html=True)
+            except Exception as e:
+                st.error(f"Erreur maturité LBP : {e}")
+            try:
+                _lbp_tbl = build_ab_table(LBP_COHORTS, LBP_WINDOW[0], LBP_WINDOW[1],
+                                          mirror=False)
+                st.markdown(render_table_html(_lbp_tbl), unsafe_allow_html=True)
+            except Exception as e:
+                st.error(f"Erreur table LBP : {e}")
 
     elif _ab_sel == "Focus DD TP":
         st.subheader("Focus — DD TP · magazine cross-brand")
