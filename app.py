@@ -363,8 +363,12 @@ def _ltv_compute(group_data: dict, price_bucket: str,
     if days_since_end < LTV_TRIAL_DAYS:
         return None  # trial still in flight for latest user
     r_max_obs = 1 + (days_since_end - LTV_TRIAL_DAYS) // cycle_days
-    # funnel_sql now returns R1-R26, cap at horizon
-    r_max_obs = min(r_max_obs, horizon)
+    # funnel_sql now returns R1-R{max_rx_observed} (par défaut 4 pour perf).
+    # On cap r_max_obs par le nombre réel de R disponibles dans `rx` (sinon
+    # obs_brut[n]=0 pour les R non scannés et la projection part dans le mur).
+    rx_keys = group_data.get("rx", {}).keys()
+    rx_available_max = max((int(k) for k in rx_keys if k.isdigit()), default=0)
+    r_max_obs = min(r_max_obs, horizon, rx_available_max if rx_available_max > 0 else 1)
     if r_max_obs < 1:
         return None
 
@@ -1079,12 +1083,19 @@ def brand_psp_join(alias: str, dims: list, filters: dict) -> str:
 # ---------------------------------------------------------------------------
 def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date] = None,
                granularity_override: str = None, cohort_pool_sql: str = None,
-               max_rx: int = 4, cohort_map_sql: str = None) -> str:
+               max_rx: int = 4, cohort_map_sql: str = None,
+               max_rx_observed: int = 4) -> str:
     # max_rx (2..4) : plafonne le calcul du funnel à R{max_rx}. Par défaut 4
     # (R0→R4, comportement inchangé pour les onglets Funnel). L'analyse A/B passe
     # à 2 (cohortes fraîches : R3/R4 toujours vides) -> supprime 2 grosses
     # jointures stg_memberships (r3/r4_tbb_raw) = beaucoup plus rapide.
+    # max_rx_observed (1..26) : plafonne le nombre de niveaux R retournés dans
+    # rx_stats (UNNEST côté final SELECT). Par défaut 4 (= comportement historique
+    # rapide). L'onglet LTV peut monter ça à 26 si besoin d'observer R5+ pour la
+    # projection LTV — mais pour les cohortes récentes (mai/juin) ça suffit
+    # largement à 4 et c'est ~10x plus rapide.
     max_rx = max(2, min(int(max_rx), 4))
+    max_rx_observed = max(1, min(int(max_rx_observed), 26))
     # granularity_override : force la granularité de cohorte (ex. 'date_day' pour
     #   l'onglet Analyse A/B) au lieu de la déduire des dims.
     # cohort_pool_sql : subquery renvoyant une colonne `customer_id`. Si fournie,
@@ -1211,6 +1222,9 @@ def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date
         else ""
     )
 
+    # UNNEST rx_idx list (R1..R{max_rx_observed}) — pre-built to avoid nested f-strings.
+    _rx_idx_array = ", ".join(f"'{i}'" for i in range(1, max_rx_observed + 1))
+
     return f"""
 DECLARE cutoff_ts TIMESTAMP DEFAULT TIMESTAMP(CURRENT_DATE());
 DECLARE default_days INT64 DEFAULT {default_days};
@@ -1300,7 +1314,7 @@ btx AS (
         AND COALESCE(is_refunded, FALSE)=FALSE
         AND COALESCE(is_alerted, FALSE)=FALSE THEN customer_email END) AS net_users
   FROM btx
-  WHERE SAFE_CAST(invoice_r_index AS INT64) BETWEEN 1 AND 26
+  WHERE SAFE_CAST(invoice_r_index AS INT64) BETWEEN 1 AND {max_rx_observed}
   GROUP BY ALL
 )
 SELECT
@@ -1324,11 +1338,7 @@ SELECT
   COALESCE(tbb.elig_users, 0) AS tbb_elig_users,
   COALESCE(tbb.cancel_users, 0) AS tbb_cancel_users
 FROM weeks w
-{dim_axis_join}CROSS JOIN UNNEST([
-  '1','2','3','4','5','6','7','8','9','10',
-  '11','12','13','14','15','16','17','18','19','20',
-  '21','22','23','24','25','26'
-]) AS rx_idx
+{dim_axis_join}CROSS JOIN UNNEST([{_rx_idx_array}]) AS rx_idx
 LEFT JOIN r0_stats r0 ON r0.cohort_week = w.week_start{dim_on_r0}
 LEFT JOIN r1_tbb_cte r1 ON r1.cohort_week = w.week_start{dim_on_r1}
 LEFT JOIN rx_stats s ON s.cohort_week = w.week_start AND s.invoice_r_index = rx_idx{dim_on_s}
