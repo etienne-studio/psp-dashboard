@@ -4260,6 +4260,14 @@ sr_r1_metrics AS (
   SELECT conciergerie, psp, bucket, 'r1_succ_users',
     CAST(COUNT(DISTINCT CASE WHEN invoice_r_index='1' AND transaction_status='succeeded' THEN customer_email END) AS FLOAT64)
   FROM ft_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+  UNION ALL
+  SELECT conciergerie, psp, bucket, 'r0_att_users',
+    CAST(COUNT(DISTINCT CASE WHEN invoice_r_index='0' THEN customer_email END) AS FLOAT64)
+  FROM ft_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
+  UNION ALL
+  SELECT conciergerie, psp, bucket, 'r0_succ_users',
+    CAST(COUNT(DISTINCT CASE WHEN invoice_r_index='0' AND transaction_status='succeeded' THEN customer_email END) AS FLOAT64)
+  FROM ft_window WHERE conciergerie IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2,3
 ),
 -- Success Rate Total (toutes R indexes confondues)
 sr_all_metrics AS (
@@ -4394,6 +4402,8 @@ sr_metrics AS (
   UNION ALL SELECT psp, bucket, 'all_fa_succ_tx', CAST(COUNT(DISTINCT CASE WHEN t_attempt_index=1 AND transaction_status='succeeded' THEN transaction_id END) AS FLOAT64) FROM ft_window WHERE conc IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2
   UNION ALL SELECT psp, bucket, 'all_att_users', CAST(COUNT(DISTINCT customer_email) AS FLOAT64) FROM ft_window WHERE conc IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2
   UNION ALL SELECT psp, bucket, 'all_succ_users', CAST(COUNT(DISTINCT CASE WHEN transaction_status='succeeded' THEN customer_email END) AS FLOAT64) FROM ft_window WHERE conc IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2
+  UNION ALL SELECT psp, bucket, 'r0_att_users', CAST(COUNT(DISTINCT CASE WHEN invoice_r_index='0' THEN customer_email END) AS FLOAT64) FROM ft_window WHERE conc IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2
+  UNION ALL SELECT psp, bucket, 'r0_succ_users', CAST(COUNT(DISTINCT CASE WHEN invoice_r_index='0' AND transaction_status='succeeded' THEN customer_email END) AS FLOAT64) FROM ft_window WHERE conc IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2
 ),
 vamp_metrics AS (
   SELECT psp, bucket, 'volume_succ_total' AS metric, CAST(COUNT(DISTINCT CASE WHEN transaction_status='succeeded' THEN transaction_id END) AS FLOAT64) AS value FROM ft_window WHERE conc IS NOT NULL AND bucket IS NOT NULL GROUP BY 1,2
@@ -4470,6 +4480,7 @@ def render_exec_billing_quarter(df: pd.DataFrame, period_start: date,
     def _ratio(ps, b, num, den):
         d = asum(ps, b, den)
         return None if d == 0 else asum(ps, b, num) / d
+    def v_r0pu(ps, b): return _ratio(ps, b, "r0_succ_users", "r0_att_users")
     def v_r1fa(ps, b): return _ratio(ps, b, "r1_fa_succ_tx", "r1_fa_tx")
     def v_r1pu(ps, b): return _ratio(ps, b, "r1_succ_users", "r1_att_users")
     def v_allfa(ps, b): return _ratio(ps, b, "all_fa_succ_tx", "all_fa_tx")
@@ -4487,6 +4498,8 @@ def render_exec_billing_quarter(df: pd.DataFrame, period_start: date,
         ("kpi", "Refund (€)", v_ref, fr_eur, True),
         ("kpi", "CA Net", v_net, fr_eur, False),
         ("sec", "✅ SUCCESS RATE", None, None, False),
+        ("sub", "R0", None, None, False),
+        ("kpi", "Success Rate R0 — Per User", v_r0pu, fr_pct, False),
         ("sub", "R1", None, None, False),
         ("kpi", "Success Rate R1 — First Attempt", v_r1fa, fr_pct, False),
         ("kpi", "Success Rate R1 — Per User", v_r1pu, fr_pct, False),
@@ -4744,6 +4757,23 @@ def render_exec_billing(df: pd.DataFrame,
     # ========================================================================
     sr_rows = []
     sr_rows.append(section_header("✅ SUCCESS RATE", "billing-sr"))
+
+    # Sub-section R0 (uniquement par user : users avec R0 succeeded / users avec ≥1 R0)
+    sr_rows.append(subsection_header("R0", "billing-sr-sub"))
+
+    def _sr_r0_pu(c, p, b):
+        denom = m(c, p, b, "r0_att_users")
+        return None if denom == 0 else m(c, p, b, "r0_succ_users") / denom
+
+    def _sr_r0_pu_total(b):
+        denom = _sum_atom(b, "r0_att_users")
+        return None if denom == 0 else _sum_atom(b, "r0_succ_users") / denom
+
+    sr_rows.append(kpi_row(
+        "Success Rate R0 — Per User", fr_pct, _sr_r0_pu,
+        total_fn=_sr_r0_pu_total, lower_is_better=False,
+        section_class="billing-sr-row"
+    ))
 
     # Sub-section R1
     sr_rows.append(subsection_header("R1", "billing-sr-sub"))
