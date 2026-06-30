@@ -806,10 +806,18 @@ def customer_pool_cte(filters: dict) -> str:
     having_sql = "\n    AND ".join(having_clauses)
     return f""",
 customer_pool AS (
+  -- Univers = customers ayant une TRANSACTION dans la fenêtre (pas signup dans
+  -- la fenêtre). Évite de perdre les transacs récurrentes des cohortes plus
+  -- anciennes sur les onglets en date de transaction (VAMP). On évalue ensuite
+  -- le filtre sur TOUTES les memberships du customer.
   SELECT fm.customer_email
   FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm
-  CROSS JOIN window_bounds wb_cp
-  WHERE DATE(fm.ms_datetime) BETWEEN wb_cp.ws_min AND wb_cp.ws_max
+  WHERE fm.customer_email IN (
+    SELECT ftw.customer_email
+    FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ftw
+    CROSS JOIN window_bounds wb_cp
+    WHERE ftw.t_date BETWEEN wb_cp.ws_min AND wb_cp.ws_max
+  )
     AND COALESCE(fm.brand, '') NOT LIKE '%helpprio%'
     AND LOWER(fm.customer_email) NOT LIKE '%@yopmail%'
     AND LOWER(fm.customer_email) NOT LIKE '%@sharebot%'
@@ -936,8 +944,12 @@ customer_price AS (
       IGNORE NULLS ORDER BY fm.ms_datetime DESC LIMIT 1
     )[SAFE_OFFSET(0)] AS price_magazine
   FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm
-  CROSS JOIN window_bounds wb_cp_price
-  WHERE DATE(fm.ms_datetime) BETWEEN wb_cp_price.ws_min AND wb_cp_price.ws_max
+  WHERE fm.customer_email IN (
+    SELECT ftw.customer_email
+    FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ftw
+    CROSS JOIN window_bounds wb_cp_price
+    WHERE ftw.t_date BETWEEN wb_cp_price.ws_min AND wb_cp_price.ws_max
+  )
     AND COALESCE(fm.brand, '') NOT LIKE '%helpprio%'
     AND LOWER(fm.customer_email) NOT LIKE '%@yopmail%'
     AND LOWER(fm.customer_email) NOT LIKE '%@sharebot%'
@@ -1024,20 +1036,34 @@ def brand_psp_cte(dims: list, filters: dict) -> str:
     if not _needs_brand_psp(dims, filters):
         return ""
     expr = _brand_psp_concat("m.brand", "m.ms_default_psp", "r")
-    r0sub = _r0_mid_subquery(
-        "AND f.t_date BETWEEN DATE_SUB(wb_r0.ws_min, INTERVAL 15 DAY) "
-        "AND DATE_ADD(wb_r0.ws_max, INTERVAL 15 DAY)",
-        "CROSS JOIN window_bounds wb_r0",
-    )
+    # Univers = memberships ayant une TRANSACTION dans la fenêtre (toute date de
+    # signup) — évite de perdre les transacs récurrentes des cohortes anciennes
+    # sur les onglets en date de transaction (VAMP Date). Le MidId du R0 est
+    # résolu pour CES memberships, quelle que soit la date du R0 (sinon un vieux
+    # NMI récurrent tomberait dans le fallback EMS).
     return f""",
 brand_psp_map AS (
   SELECT m.membership_id, {expr} AS brand_psp
   FROM `eu-andy-marketing-raw.dashboard.fact_memberships` m
   LEFT JOIN (
-    {r0sub}
+    SELECT f.membership_id, ANY_VALUE(s.MidId) AS MidId
+    FROM `eu-andy-marketing-raw.dashboard.fact_transactions` f
+    JOIN `eu-andy-marketing-raw.silver_sgw.stg_transactions` s ON f.transaction_id = s.Id
+    WHERE f.t_psp_name = 'nmi' AND f.invoice_r_index = '0'
+      AND f.membership_id IN (
+        SELECT f2.membership_id
+        FROM `eu-andy-marketing-raw.dashboard.fact_transactions` f2
+        CROSS JOIN window_bounds wb_r0
+        WHERE f2.t_date BETWEEN wb_r0.ws_min AND wb_r0.ws_max
+      )
+    GROUP BY f.membership_id
   ) r ON r.membership_id = m.membership_id
-  CROSS JOIN window_bounds wb_bpsp
-  WHERE DATE(m.ms_datetime) BETWEEN wb_bpsp.ws_min AND wb_bpsp.ws_max
+  WHERE m.membership_id IN (
+    SELECT f3.membership_id
+    FROM `eu-andy-marketing-raw.dashboard.fact_transactions` f3
+    CROSS JOIN window_bounds wb_bpsp
+    WHERE f3.t_date BETWEEN wb_bpsp.ws_min AND wb_bpsp.ws_max
+  )
 )"""
 
 
