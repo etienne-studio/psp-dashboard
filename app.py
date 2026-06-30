@@ -937,6 +937,10 @@ def customer_price_cte(dims: list) -> str:
     mb = _MAGAZINE_BUCKETS.format(alias="fm")
     return f""",
 customer_price AS (
+  -- Borné sur la fenêtre via ms_date (partition prune) : pour les cohortes de
+  -- la fenêtre, le bucket prix vient nécessairement d'une membership dans la
+  -- fenêtre. Sans cette borne on scanne tout l'historique de fact_memberships
+  -- pour chaque customer = timeout sur les fenêtres larges.
   SELECT
     fm.customer_email,
     ARRAY_AGG(
@@ -948,12 +952,8 @@ customer_price AS (
       IGNORE NULLS ORDER BY fm.ms_datetime DESC LIMIT 1
     )[SAFE_OFFSET(0)] AS price_magazine
   FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm
-  WHERE fm.customer_email IN (
-    SELECT ftw.customer_email
-    FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ftw
-    CROSS JOIN window_bounds wb_cp_price
-    WHERE ftw.t_date BETWEEN wb_cp_price.ws_min AND wb_cp_price.ws_max
-  )
+  CROSS JOIN window_bounds wb_cp_price
+  WHERE fm.ms_date BETWEEN wb_cp_price.ws_min AND wb_cp_price.ws_max
     AND COALESCE(fm.brand, '') NOT LIKE '%helpprio%'
     AND LOWER(fm.customer_email) NOT LIKE '%@yopmail%'
     AND LOWER(fm.customer_email) NOT LIKE '%@sharebot%'
@@ -2638,7 +2638,8 @@ def funnel_graph_data(
 
 
 def render_funnel_graph(brand_type: str, filters: dict, picked_start, picked_end, key_prefix: str,
-                         kpi_sections: list = None, all_kpis: list = None) -> None:
+                         kpi_sections: list = None, all_kpis: list = None,
+                         max_rx: int = 4) -> None:
     """Render the "Évolution dans le temps" graph section under a funnel tab.
 
     Layout mirrors the funnel TABLE structure:
@@ -2701,7 +2702,7 @@ def render_funnel_graph(brand_type: str, filters: dict, picked_start, picked_end
     # --- Data fetch ----------------------------------------------------------
     with st.spinner("Graphe…"):
         try:
-            raw_df = run_query(funnel_sql(brand_type, filters, graph_dims_list, graph_weeks_list))
+            raw_df = run_query(funnel_sql(brand_type, filters, graph_dims_list, graph_weeks_list, max_rx=max_rx))
             graph_df = funnel_graph_data(
                 raw_df, graph_time_dim[0], curve_key,
                 picked_end=picked_end, brand_type=brand_type,
@@ -5748,7 +5749,11 @@ elif page == "LTV":
     )
     with st.spinner("LTV…"):
         try:
-            df = run_query(funnel_sql("Booking", filters, dims, weeks_list))
+            # Tab LTV n'utilise pas les KPI TBB (% Billed / # To Be Billed) → on
+            # passe max_rx=2 pour skip les CTEs r3_tbb_raw/r4_tbb_raw (jointures
+            # stg_memberships coûteuses). max_rx_observed=4 conserve rx_stats
+            # R1-R4 (utilisés pour ARPU + projection LTV).
+            df = run_query(funnel_sql("Booking", filters, dims, weeks_list, max_rx=2))
             table = build_ltv_table(df, dims, picked_end=_picked_end)
             st.markdown(render_table_html(table), unsafe_allow_html=True)
         except Exception as e:
@@ -5759,6 +5764,7 @@ elif page == "LTV":
     render_funnel_graph(
         "Booking", filters, _picked_start, _picked_end, key_prefix="ltv",
         kpi_sections=LTV_KPI_SECTIONS, all_kpis=ALL_LTV_KPIS,
+        max_rx=2,
     )
 
 elif page == "VAMP Cohort":
