@@ -4612,6 +4612,17 @@ def render_exec_billing(df: pd.DataFrame,
     # Summary : sélection sur le CA encaissé 30 j glissants (col_ca_ref) >= seuil,
     # pour ne pas masquer des colonnes à cause de la fenêtre hebdo plus courte.
     pairs = [(c, p, _exec_psp_label(p)) for (c, p) in _exec_visible_pairs(data, "col_ca_ref")]
+    # Regroupe les colonnes PAR PSP (puis conciergerie) pour qu'on distingue
+    # clairement les blocs PSP ; un trait épais sépare chaque groupe de PSP.
+    _psp_ord = {p: i for i, p in enumerate(
+        ["trustpayment", "pixxles", "labanquepostale", "EMS", "Kadima", "Cliq", "CASH"])}
+    _conc_ord = {c: i for i, c in enumerate(_EXEC_CONC_ORDER)}
+    pairs.sort(key=lambda t: (_psp_ord.get(t[1], 99), _conc_ord.get(t[0], 99), t[0]))
+    # col_cls[i] = 'exec-grp-start' si la colonne démarre un nouveau bloc PSP.
+    col_cls = [
+        "exec-grp-start" if (i > 0 and p != pairs[i - 1][1]) else ""
+        for i, (c, p, _l) in enumerate(pairs)
+    ]
 
     # --- Formatters FR ---
     def fr_int(v):
@@ -4643,14 +4654,14 @@ def render_exec_billing(df: pd.DataFrame,
 
     # --- Header (colonnes dynamiques + Total) ---
     header_cells = "".join(
-        "<th>"
+        f"<th class='{col_cls[i]}'>"
         f"<div class='exec-th-conc'>{c}</div>"
         f"<div class='exec-th-psp'>({lbl})</div>"
         "</th>"
-        for (c, p, lbl) in pairs
+        for i, (c, p, lbl) in enumerate(pairs)
     )
     header_cells += (
-        "<th class='exec-th-total'>"
+        "<th class='exec-th-total exec-grp-start'>"
         "<div class='exec-th-conc'>Total</div>"
         f"<div class='exec-th-psp'>({len(pairs)} colonnes)</div>"
         "</th>"
@@ -4663,7 +4674,7 @@ def render_exec_billing(df: pd.DataFrame,
     def kpi_row(label, fmt, compute_fn, total_fn=None, lower_is_better=False,
                 section_class=""):
         cells = []
-        for (c, p, _lbl) in pairs:
+        for i, (c, p, _lbl) in enumerate(pairs):
             v1 = compute_fn(c, p, "s1")
             v2 = compute_fn(c, p, "s2")
             value_str = fmt(v1) if v1 is not None else "—"
@@ -4672,7 +4683,7 @@ def render_exec_billing(df: pd.DataFrame,
                 lower_is_better=lower_is_better
             )
             cells.append(
-                f"<td><div class='exec-cell-val'>{value_str}</div>"
+                f"<td class='{col_cls[i]}'><div class='exec-cell-val'>{value_str}</div>"
                 f"<div class='exec-cell-wow'>{delta_str}</div></td>"
             )
         if total_fn is not None:
@@ -4684,7 +4695,7 @@ def render_exec_billing(df: pd.DataFrame,
                 lower_is_better=lower_is_better
             )
             cells.append(
-                f"<td class='exec-total-cell'>"
+                f"<td class='exec-total-cell exec-grp-start'>"
                 f"<div class='exec-cell-val'>{t_value_str}</div>"
                 f"<div class='exec-cell-wow'>{t_delta_str}</div></td>"
             )
@@ -4899,6 +4910,17 @@ def render_exec_billing(df: pd.DataFrame,
         background: #f1f5f9 !important;
         border-top: 1px solid #cbd5e1 !important;
         border-bottom: 1px solid #cbd5e1 !important;
+      }
+
+      /* Séparation des colonnes : trait fin entre chaque colonne, trait ÉPAIS
+         à chaque changement de PSP (regroupement des colonnes par PSP). */
+      .billing-table th, .billing-table td { border-right: 1px solid #e5e8ee; }
+      .billing-table td.exec-grp-start,
+      .billing-table th.exec-grp-start { border-left: 3px solid #64748b !important; }
+      /* La bordure épaisse ne doit pas s'appliquer aux bandeaux de section
+         (colspan) — ils restent pleine largeur. */
+      .billing-section-header td, .billing-subsection-header td {
+        border-right: 0 !important; border-left: 0 !important;
       }
     </style>
     """
