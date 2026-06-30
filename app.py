@@ -742,7 +742,8 @@ def periods_in_range(start: date, end: date, granularity: str = "date_week") -> 
     return weeks_in_range(start, end)
 
 
-def weeks_cte_sql(weeks_list: List[date], granularity: str = "date_week") -> str:
+def weeks_cte_sql(weeks_list: List[date], granularity: str = "date_week",
+                   picked_end: date = None) -> str:
     """Build the WITH weeks / window_bounds CTE from a list of period-start dates.
     Despite the legacy name, this works for any granularity (day/week/month) —
     we keep the CTE & column names as `weeks` / `week_start` / `week_label` for
@@ -750,6 +751,12 @@ def weeks_cte_sql(weeks_list: List[date], granularity: str = "date_week") -> str
 
     `window_bounds` covers from the first period to the end of the last period
     (last day for daily, last day-of-week for weekly, last day-of-month for monthly).
+
+    Si `picked_end` est fourni, ws_max est CAPPÉ par cette date. Sert quand la
+    sidebar plafonne la fenêtre avant la fin de la dernière période (ex :
+    granularité mois, fenêtre jusqu'au 25 juin → la cohorte juin ne doit
+    contenir que les users 1-25 juin, pas 1-30 juin, sinon les R1 pas encore
+    matures gonflent artificiellement le churn R0/R1).
     """
     if not weeks_list:
         weeks_arr = "DATE '1970-01-01'"
@@ -763,6 +770,9 @@ def weeks_cte_sql(weeks_list: List[date], granularity: str = "date_week") -> str
         ws_max_expr = "DATE_SUB(DATE_ADD(MAX(week_start), INTERVAL 1 MONTH), INTERVAL 1 DAY)"
     else:
         ws_max_expr = "DATE_ADD(MAX(week_start), INTERVAL 6 DAY)"
+    # Cap par picked_end si fourni (cf. docstring)
+    if picked_end is not None:
+        ws_max_expr = f"LEAST({ws_max_expr}, DATE '{picked_end.isoformat()}')"
     return f"""
 WITH weeks AS (
   SELECT
@@ -1142,7 +1152,7 @@ def brand_psp_join(alias: str, dims: list, filters: dict) -> str:
 def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date] = None,
                granularity_override: str = None, cohort_pool_sql: str = None,
                max_rx: int = 4, cohort_map_sql: str = None,
-               max_rx_observed: int = 4) -> str:
+               max_rx_observed: int = 4, picked_end: date = None) -> str:
     # max_rx (2..4) : plafonne le calcul du funnel à R{max_rx}. Par défaut 4
     # (R0→R4, comportement inchangé pour les onglets Funnel). L'analyse A/B passe
     # à 2 (cohortes fraîches : R3/R4 toujours vides) -> supprime 2 grosses
@@ -1161,7 +1171,7 @@ def funnel_sql(brand_type: str, filters: dict, dims: list, weeks_list: List[date
     #   cohorte A/B custom (psp/productId/metadata) sans la coder en filtre.
     granularity = granularity_override or date_dim_key(dims) or "date_week"
     trunc_arg = _DATE_DIM_TRUNC[granularity]
-    weeks_cte = weeks_cte_sql(weeks_list, granularity) if weeks_list is not None else WEEKS_CTE
+    weeks_cte = weeks_cte_sql(weeks_list, granularity, picked_end=picked_end) if weeks_list is not None else WEEKS_CTE
     is_booking = brand_type == "Booking"
     token_filter = (
         "AND NOT (sm.Segment = 'unknown' AND sm.Country = '' AND sm.Language = '')"
@@ -1405,10 +1415,11 @@ ORDER BY w.week_start, {dim_cols_trailing(dims, "da") if has_nw else ""}rx_idx
 """
 
 
-def vamp_cohort_sql(filters: dict, dims: list, weeks_list: List[date] = None) -> str:
+def vamp_cohort_sql(filters: dict, dims: list, weeks_list: List[date] = None,
+                     picked_end: date = None) -> str:
     granularity = date_dim_key(dims) or "date_week"
     trunc_arg = _DATE_DIM_TRUNC[granularity]
-    weeks_cte = weeks_cte_sql(weeks_list, granularity) if weeks_list is not None else WEEKS_CTE
+    weeks_cte = weeks_cte_sql(weeks_list, granularity, picked_end=picked_end) if weeks_list is not None else WEEKS_CTE
     cp_cte = customer_pool_cte(filters)
     cp_join_ft = customer_pool_join("ft", filters)
     cp_price_cte = customer_price_cte(dims)
@@ -1489,10 +1500,11 @@ ORDER BY w.week_start, {dim_cols_trailing(dims, "da") if has_nw else ""}cat
 """
 
 
-def vamp_date_sql(filters: dict, dims: list, weeks_list: List[date] = None) -> str:
+def vamp_date_sql(filters: dict, dims: list, weeks_list: List[date] = None,
+                   picked_end: date = None) -> str:
     granularity = date_dim_key(dims) or "date_week"
     trunc_arg = _DATE_DIM_TRUNC[granularity]
-    weeks_cte = weeks_cte_sql(weeks_list, granularity) if weeks_list is not None else WEEKS_CTE
+    weeks_cte = weeks_cte_sql(weeks_list, granularity, picked_end=picked_end) if weeks_list is not None else WEEKS_CTE
     cp_cte = customer_pool_cte(filters)
     cp_join_ft = customer_pool_join("ft", filters)
     cp_join_t = customer_pool_join("t", filters)
@@ -2839,6 +2851,7 @@ def render_funnel_graph(brand_type: str, filters: dict, picked_start, picked_end
             raw_df = run_query(funnel_sql(
                 brand_type, filters, graph_dims_list, graph_weeks_list,
                 max_rx=max_rx, max_rx_observed=_gmax_rx_obs,
+                picked_end=picked_end,
             ))
             graph_df = funnel_graph_data(
                 raw_df, graph_time_dim[0], curve_key,
@@ -5855,7 +5868,8 @@ elif page == "Exec Billing par PSP — Trimestre":
 elif page == "Funnel Booking":
     with st.spinner("Funnel Booking…"):
         try:
-            df = run_query(funnel_sql("Booking", filters, dims, weeks_list))
+            df = run_query(funnel_sql("Booking", filters, dims, weeks_list,
+                                       picked_end=_picked_end))
             table = build_funnel_table(df, "Booking", dims, picked_end=_picked_end)
             st.markdown(render_table_html(table), unsafe_allow_html=True)
         except Exception as e:
@@ -5868,8 +5882,9 @@ elif page == "Funnel Booking":
 elif page == "Funnel Magazine":
     with st.spinner("Funnel Magazine…"):
         try:
-            df = run_query(funnel_sql("Magazine", filters, dims, weeks_list))
-            table = build_funnel_table(df, "Magazine", dims)
+            df = run_query(funnel_sql("Magazine", filters, dims, weeks_list,
+                                       picked_end=_picked_end))
+            table = build_funnel_table(df, "Magazine", dims, picked_end=_picked_end)
             st.markdown(render_table_html(table), unsafe_allow_html=True)
         except Exception as e:
             st.error(f"Erreur Funnel Magazine : {e}")
@@ -5898,6 +5913,7 @@ elif page == "LTV":
             df = run_query(funnel_sql(
                 "Booking", filters, dims, weeks_list,
                 max_rx=2, max_rx_observed=_ltv_max_rx_obs,
+                picked_end=_picked_end,
             ))
             table = build_ltv_table(df, dims, picked_end=_picked_end)
             st.markdown(render_table_html(table), unsafe_allow_html=True)
