@@ -3851,6 +3851,281 @@ def _exec_billing_period_bounds(week_start: date, week_end: date) -> tuple:
     return week_start, week_end, s2_start, s2_end
 
 
+def exec_quarter_sql(period_start: date, period_end: date) -> str:
+    """Exec agrégé par PSP (conciergeries regroupées), sur 3 mois glissants
+    finissant au mois sélectionné : m3 = sélection (possiblement MTD), m2/m1 = 2
+    mois complets précédents. NMI regroupé en un seul 'NMI' (pas d'éclatement
+    processeur -> pas besoin du MidId map). Mêmes atomes/dates que
+    exec_summary_sql ; ratios recomposés au rendu (somme num./dénom.)."""
+    m3s = period_start.replace(day=1)
+    m2s = (m3s - timedelta(days=1)).replace(day=1)
+    m1s = (m2s - timedelta(days=1)).replace(day=1)
+    m1, m2, m3, p_end = (d.isoformat() for d in (m1s, m2s, m3s, period_end))
+
+    def _psp(col):
+        # NMI (toutes MID) regroupé ; hors NMI = ms_default_psp brut.
+        return f"CASE WHEN {col} = 'nmi' THEN 'NMI' ELSE {col} END"
+    psp_fm, psp_ft, psp_t = (_psp("fm.ms_default_psp"),
+                             _psp("ft.ms_default_psp"), _psp("t.ms_default_psp"))
+
+    def _conc(alias, col):  # sert juste à exclure helpprio / marques inconnues
+        return (f"CASE LOWER(SPLIT(COALESCE({alias}.{col}, ''), ' - ')[OFFSET(0)]) "
+                "WHEN 'reserv-go' THEN 'x' WHEN 'book-ici' THEN 'x' "
+                "WHEN 'resadexa' THEN 'x' WHEN 'rezaflash' THEN 'x' "
+                "WHEN 'jumpaide.com' THEN 'x' WHEN 'concimax' THEN 'x' "
+                "WHEN 'rapidoxy' THEN 'x' ELSE NULL END")
+    fm_conc, ft_conc, t_conc = (_conc("fm", "brand"),
+                                _conc("ft", "t_brand"), _conc("t", "t_brand"))
+
+    def _bucket(datecol):
+        return (f"CASE DATE_TRUNC({datecol}, MONTH) "
+                f"WHEN DATE '{m1}' THEN 'm1' WHEN DATE '{m2}' THEN 'm2' "
+                f"WHEN DATE '{m3}' THEN 'm3' END")
+
+    return f"""
+WITH bounds AS (SELECT DATE '{m1}' AS scan_start, DATE '{p_end}' AS scan_end),
+fm_in_window AS (
+  SELECT fm.membership_id, fm.customer_id, fm.brand_type, fm.ms_status, fm.ms_date,
+    fm.ms_trial_end, {psp_fm} AS psp,
+    COALESCE(fm.ms_cancelled_during_trial, FALSE) AS cancelled_during_trial,
+    {fm_conc} AS conc
+  FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm CROSS JOIN bounds
+  WHERE fm.ms_status NOT IN ('abandonned','processing')
+    AND ((fm.ms_date BETWEEN scan_start AND scan_end)
+      OR (fm.ms_trial_end BETWEEN scan_start AND scan_end))
+),
+r0 AS (
+  SELECT psp, {_bucket('ms_date')} AS bucket, 'r0' AS metric,
+    CAST(COUNT(DISTINCT customer_id) AS FLOAT64) AS value
+  FROM fm_in_window CROSS JOIN bounds
+  WHERE conc IS NOT NULL AND ms_date BETWEEN scan_start AND scan_end
+  GROUP BY 1, 2
+),
+churn_cohort AS (
+  SELECT psp, bucket, customer_id,
+    MAX(IF(r1.membership_id IS NOT NULL, 1, 0)) AS has_r1_net
+  FROM (
+    SELECT fm.psp, fm.customer_id, fm.membership_id, {_bucket('fm.ms_date')} AS bucket
+    FROM fm_in_window fm CROSS JOIN bounds
+    WHERE fm.conc IS NOT NULL AND fm.brand_type='Booking'
+      AND fm.ms_status NOT IN ('abandonned','processing','paused')
+      AND fm.ms_date BETWEEN scan_start AND scan_end
+      AND (fm.ms_trial_end <= CURRENT_DATE() OR fm.cancelled_during_trial = TRUE)
+  ) fmb
+  LEFT JOIN (
+    SELECT DISTINCT membership_id
+    FROM `eu-andy-marketing-raw.dashboard.fact_transactions`
+    WHERE invoice_r_index='1' AND transaction_status='succeeded'
+      AND is_refunded=FALSE AND is_alerted=FALSE AND brand_type='Booking'
+  ) r1 ON r1.membership_id = fmb.membership_id
+  GROUP BY 1, 2, 3
+),
+churn_agg AS (
+  SELECT psp, bucket, 'churn_cohort_size' AS metric, CAST(COUNT(*) AS FLOAT64) AS value
+  FROM churn_cohort GROUP BY 1, 2
+  UNION ALL
+  SELECT psp, bucket, 'r1_net_count', CAST(SUM(has_r1_net) AS FLOAT64)
+  FROM churn_cohort GROUP BY 1, 2
+),
+ft_in_window AS (
+  SELECT ft.transaction_id, ft.transaction_amount, ft.transaction_status,
+    {psp_ft} AS psp, {ft_conc} AS conc, {_bucket('ft.t_date')} AS bucket
+  FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft CROSS JOIN bounds
+  WHERE ft.t_date BETWEEN scan_start AND scan_end
+),
+refund_in_window AS (
+  SELECT ft.transaction_amount, {psp_ft} AS psp, {ft_conc} AS conc,
+    {_bucket('ft.refunded_at_utc')} AS bucket
+  FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft CROSS JOIN bounds
+  WHERE ft.is_refunded=TRUE AND ft.refunded_at_utc BETWEEN scan_start AND scan_end
+),
+ft_visa AS (
+  SELECT ft.transaction_id, {psp_ft} AS psp, {ft_conc} AS conc, {_bucket('ft.t_date')} AS bucket
+  FROM `eu-andy-marketing-raw.dashboard.fact_transactions` ft CROSS JOIN bounds
+  WHERE ft.t_date BETWEEN scan_start AND scan_end AND ft.transaction_status='succeeded'
+    AND UPPER(ft.t_card_brand) IN ('VISA','DELTA')
+),
+tx_metrics AS (
+  SELECT psp, bucket, 'brut' AS metric,
+    SUM(CASE WHEN transaction_status='succeeded' THEN transaction_amount ELSE 0 END) AS value
+  FROM ft_in_window WHERE conc IS NOT NULL AND bucket IS NOT NULL GROUP BY 1, 2
+  UNION ALL
+  SELECT psp, bucket, 'refund_rev', SUM(transaction_amount)
+  FROM refund_in_window WHERE conc IS NOT NULL AND bucket IS NOT NULL GROUP BY 1, 2
+  UNION ALL
+  SELECT psp, bucket, 'tx_succ_visa', CAST(COUNT(DISTINCT transaction_id) AS FLOAT64)
+  FROM ft_visa WHERE conc IS NOT NULL AND bucket IS NOT NULL GROUP BY 1, 2
+),
+alerts_join AS (
+  SELECT fa.transaction_id, {t_conc} AS conc, {psp_t} AS psp,
+    {_bucket('fa.alerted_at')} AS bucket
+  FROM `eu-andy-marketing-raw.dashboard.fact_alert` fa
+  JOIN `eu-andy-marketing-raw.dashboard.fact_transactions` t USING (transaction_id)
+  CROSS JOIN bounds
+  WHERE fa.alerted_at BETWEEN scan_start AND scan_end AND UPPER(fa.cardnetwork)='VISA'
+),
+alerts_metrics AS (
+  SELECT psp, bucket, 'alerts_visa' AS metric, CAST(COUNT(DISTINCT transaction_id) AS FLOAT64) AS value
+  FROM alerts_join WHERE conc IS NOT NULL AND bucket IS NOT NULL GROUP BY 1, 2
+)
+SELECT psp, bucket, metric, value FROM r0
+UNION ALL SELECT psp, bucket, metric, value FROM churn_agg
+UNION ALL SELECT psp, bucket, metric, value FROM tx_metrics
+UNION ALL SELECT psp, bucket, metric, value FROM alerts_metrics
+"""
+
+
+_EXEC_QUARTER_PSP_ORDER = ["trustpayment", "pixxles", "labanquepostale", "NMI"]
+
+
+def render_exec_quarter(df: pd.DataFrame, period_start: date, period_end: date) -> str:
+    """Rendu de l'Exec agrégé par PSP, 3 mois (trimestre glissant). Colonnes =
+    PSP × {m1, m2, m3}, juste la valeur (l'évolution se lit sur les 3 mois)."""
+    if df.empty:
+        return "<div style='color:#64748b;padding:12px;'>Aucune donnée</div>"
+    data: dict = {}
+    for _, r in df.iterrows():
+        try:
+            v = float(r["value"]) if pd.notna(r["value"]) else 0.0
+        except (TypeError, ValueError):
+            v = 0.0
+        data.setdefault((r["psp"], r["bucket"]), {})[r["metric"]] = v
+
+    def m(psp, b, metric):
+        return data.get((psp, b), {}).get(metric, 0.0)
+
+    m3s = period_start.replace(day=1)
+    m2s = (m3s - timedelta(days=1)).replace(day=1)
+    m1s = (m2s - timedelta(days=1)).replace(day=1)
+    buckets = [("m1", _FR_MONTHS[m1s.month]), ("m2", _FR_MONTHS[m2s.month]),
+               ("m3", _FR_MONTHS[m3s.month])]
+
+    psps_present = {p for (p, _b) in data.keys()}
+
+    def quarter_brut(psp):
+        return sum(m(psp, b, "brut") for b, _l in buckets)
+    shown = [p for p in psps_present if quarter_brut(p) >= 1000.0]
+    _order = {p: i for i, p in enumerate(_EXEC_QUARTER_PSP_ORDER)}
+    shown.sort(key=lambda p: (_order.get(p, 99), p))
+
+    def psp_label(p):
+        return _EXEC_PSP_LABELS.get(p, p)
+
+    def fr_int(v):
+        return f"{int(round(v)):,}".replace(",", " ")
+
+    def fr_pct(v):
+        return "—" if v is None else f"{v*100:.1f}%".replace(".", ",")
+
+    def fr_eur(v):
+        if abs(v) >= 1000:
+            return f"{v/1000:,.1f} K€".replace(",", " ").replace(".", ",")
+        return f"{v:,.0f} €".replace(",", " ")
+
+    def k_r0(psp, b):
+        return fr_int(m(psp, b, "r0"))
+
+    def k_ca(psp, b):
+        return fr_eur(m(psp, b, "brut") - m(psp, b, "refund_rev"))
+
+    def k_churn(psp, b):
+        coh, r1 = m(psp, b, "churn_cohort_size"), m(psp, b, "r1_net_count")
+        return fr_pct(None if coh == 0 else 1 - r1 / coh)
+
+    def k_refund(psp, b):
+        brut, ref = m(psp, b, "brut"), m(psp, b, "refund_rev")
+        return fr_pct(None if brut == 0 else ref / brut)
+
+    def k_vamp(psp, b):
+        d, n = m(psp, b, "tx_succ_visa"), m(psp, b, "alerts_visa")
+        return fr_pct(None if d == 0 else n / d)
+
+    def tsum(b, atom):
+        return sum(m(p, b, atom) for p in shown)
+
+    def t_r0(b):
+        return fr_int(tsum(b, "r0"))
+
+    def t_ca(b):
+        return fr_eur(tsum(b, "brut") - tsum(b, "refund_rev"))
+
+    def t_churn(b):
+        coh, r1 = tsum(b, "churn_cohort_size"), tsum(b, "r1_net_count")
+        return fr_pct(None if coh == 0 else 1 - r1 / coh)
+
+    def t_refund(b):
+        brut, ref = tsum(b, "brut"), tsum(b, "refund_rev")
+        return fr_pct(None if brut == 0 else ref / brut)
+
+    def t_vamp(b):
+        d, n = tsum(b, "tx_succ_visa"), tsum(b, "alerts_visa")
+        return fr_pct(None if d == 0 else n / d)
+
+    kpis = [
+        ("# R0 (customers)", k_r0, t_r0),
+        ("€ CA Net", k_ca, t_ca),
+        ("% Churn R0→R1 (Booking)", k_churn, t_churn),
+        ("% Refund (CA)", k_refund, t_refund),
+        ("% VAMP Ratio (Visa)", k_vamp, t_vamp),
+    ]
+
+    # Header : ligne 1 = PSP (colspan 3) ; ligne 2 = les 3 mois.
+    h1 = "<th class='eq-kpi' rowspan='2'>KPI</th>"
+    for p in shown:
+        h1 += f"<th colspan='3' class='eq-grp'>{psp_label(p)}</th>"
+    h1 += "<th colspan='3' class='eq-grp eq-total'>Total</th>"
+    h2 = ""
+    for _ in shown:
+        for _b, lbl in buckets:
+            h2 += f"<th class='eq-mo'>{lbl}</th>"
+    for _b, lbl in buckets:
+        h2 += f"<th class='eq-mo eq-total'>{lbl}</th>"
+
+    body = ""
+    for label, fn, tfn in kpis:
+        cells = ""
+        for i, p in enumerate(shown):
+            for j, (b, _l) in enumerate(buckets):
+                bnd = " eq-bound" if j == 2 else ""
+                cells += f"<td class='eq-val{bnd}'>{fn(p, b)}</td>"
+        for j, (b, _l) in enumerate(buckets):
+            bnd = " eq-bound" if j == 2 else ""
+            cells += f"<td class='eq-val eq-total{bnd}'>{tfn(b)}</td>"
+        body += f"<tr><td class='eq-kpi'>{label}</td>{cells}</tr>"
+
+    is_mtd = period_end < _last_day_of_month(period_start)
+    sel = f"{_fr_month_year(m3s)}" + (" (MTD)" if is_mtd else "")
+    sub = (f"Trimestre glissant : {_FR_MONTHS[m1s.month]} · {_FR_MONTHS[m2s.month]} · "
+           f"{_FR_MONTHS[m3s.month]} {m3s.year}. Conciergeries agrégées par PSP "
+           f"(NMI regroupé). Mois sélectionné : {sel}.")
+
+    css = """
+    <style>
+      .eq-wrap { font-size: 13px; overflow-x: auto; }
+      .eq-note { background:#fef3c7; border-left:4px solid #f59e0b; padding:8px 12px;
+                 border-radius:4px; margin-bottom:12px; font-size:13px; }
+      table.eq { border-collapse: separate; border-spacing: 0; background:white;
+                 border:1px solid #cbd5e1; border-radius:8px; overflow:hidden; }
+      table.eq th, table.eq td { padding:8px 12px; text-align:center; white-space:nowrap; }
+      table.eq thead th { background:#0f172a; color:white; font-weight:600;
+                          position:sticky; top:0; }
+      th.eq-grp { border-left:2px solid #334155; font-size:13px; }
+      th.eq-mo { background:#1e293b; color:#cbd5e1; font-weight:500; font-size:12px; }
+      th.eq-kpi, td.eq-kpi { text-align:left; position:sticky; left:0; z-index:1;
+                             background:#1e293b; color:white; font-weight:600; min-width:200px; }
+      td.eq-kpi { background:#f8fafc; color:#0f172a; }
+      td.eq-val { color:#0f172a; min-width:78px; }
+      td.eq-bound { border-right:2px solid #cbd5e1; }
+      .eq-total { background:#f1f5f9; font-weight:700; }
+      th.eq-total { background:#1e293b; }
+      tbody tr:nth-child(even) td.eq-val { background:#fbfcfe; }
+    </style>
+    """
+    table = (f"<table class='eq'><thead><tr>{h1}</tr><tr>{h2}</tr></thead>"
+             f"<tbody>{body}</tbody></table>")
+    return f"{css}<div class='eq-wrap'><div class='eq-note'>{sub}</div>{table}</div>"
+
+
 def exec_billing_sql(s1_start: date, s1_end: date,
                      s2_start: date, s2_end: date) -> str:
     """SQL Executive Summary Billing — atomes par (conciergerie, psp, bucket).
@@ -4388,8 +4663,8 @@ st.caption("Funnel + VAMP — basé sur le skill `weekly-psp-report` (v3) — di
 # interaction. Ici on ne charge que la page regardée, et les contrôles funnel
 # (dates/dims/filtres) seulement si la page en a besoin.
 st.sidebar.header("Page")
-_PAGES = ["Executive Summary", "Executive Summary Billing", "Funnel Booking",
-          "Funnel Magazine", "VAMP Cohort", "VAMP Date", "Analyse A/B"]
+_PAGES = ["Executive Summary", "Exec par PSP — Trimestre", "Executive Summary Billing",
+          "Funnel Booking", "Funnel Magazine", "VAMP Cohort", "VAMP Date", "Analyse A/B"]
 page = st.sidebar.radio("Aller à", _PAGES, index=0, key="page_nav",
                         label_visibility="collapsed")
 st.sidebar.divider()
@@ -4862,6 +5137,25 @@ if page == "Executive Summary":
             )
         except Exception as e:
             st.error(f"Erreur Executive Summary : {e}")
+
+elif page == "Exec par PSP — Trimestre":
+    # Agrégé par PSP (conciergeries regroupées), 3 mois glissants finissant au
+    # mois sélectionné (Avr/Mai/Juin si juin). NMI regroupé.
+    _eq_months = _months_for_exec_selector(12)
+    _eq_labels = [mth[0] for mth in _eq_months]
+    _eq_sel = st.selectbox("📅 Mois de fin (→ trimestre des 3 mois)", options=_eq_labels,
+                           index=0, key="exec_quarter_selector",
+                           help="Sélectionne le dernier mois ; les 2 mois précédents sont ajoutés.")
+    _eq_idx = _eq_labels.index(_eq_sel)
+    _eq_p_start = _eq_months[_eq_idx][1]
+    _eq_p_end = _eq_months[_eq_idx][2]
+    with st.spinner("Exec par PSP — Trimestre…"):
+        try:
+            df_eq = run_query(exec_quarter_sql(_eq_p_start, _eq_p_end))
+            st.markdown(render_exec_quarter(df_eq, _eq_p_start, _eq_p_end),
+                        unsafe_allow_html=True)
+        except Exception as e:
+            st.error(f"Erreur Exec par PSP : {e}")
 
 elif page == "Executive Summary Billing":
     # Indépendant de la sidebar : son propre sélecteur de semaine (WTD courant
