@@ -346,9 +346,18 @@ def _ltv_get_price_from_group(group_key: tuple, dims: list):
 
 def _ltv_cohort_end_date(group_sort_key_tuple: tuple, dims: list,
                           picked_end_date: date) -> date:
-    """Determine the END date of the cohort window for max_R_observable.
-    - If a date dim is in dims : use week_start + period span
-    - Else : use the sidebar's picked_end (cohort spans entire window)"""
+    """Determine the END date of the cohort window (= LATEST user signup).
+
+    Pour le calcul de maturité dans _ltv_compute : le LATEST user de la cohorte
+    est le dernier inscrit. Si la sidebar plafonne la fenêtre (picked_end), on
+    cap aussi : le LATEST user de la cohorte n'est pas au-delà de picked_end.
+
+    Ex: cohorte juin (1-30 juin) avec sidebar picked_end=25 juin → LATEST user
+    est du 25 juin (pas du 30) → mature R1 le 28 juin → today=30 juin OK.
+
+    - Si dim date : end = period_end (week/month) capped par picked_end
+    - Sinon : picked_end direct (cohort spans entire window)
+    """
     if dims:
         for i, d in enumerate(dims):
             if d[0] in _DATE_DIM_KEYS and i < len(group_sort_key_tuple):
@@ -358,15 +367,20 @@ def _ltv_cohort_end_date(group_sort_key_tuple: tuple, dims: list,
                 except (ValueError, TypeError):
                     return picked_end_date
                 if d[0] == "date_day":
-                    return ws
+                    period_end = ws
                 elif d[0] == "date_week":
-                    return ws + timedelta(days=6)
+                    period_end = ws + timedelta(days=6)
                 elif d[0] == "date_month":
                     if ws.month == 12:
                         next_month = date(ws.year + 1, 1, 1)
                     else:
                         next_month = date(ws.year, ws.month + 1, 1)
-                    return next_month - timedelta(days=1)
+                    period_end = next_month - timedelta(days=1)
+                else:
+                    period_end = picked_end_date
+                # Cap par sidebar picked_end (la cohorte ne va pas au-delà
+                # de la fin de fenêtre sélectionnée par l'user)
+                return min(period_end, picked_end_date)
     return picked_end_date
 
 
@@ -377,6 +391,11 @@ def _ltv_compute(group_data: dict, price_bucket: str,
 
     Returns dict with keys arpu_brut_eur, arpu_net_eur, ltv_brut_eur,
     ltv_net_eur, r_max_obs, or None if not computable.
+
+    Maturité = basée sur le LATEST user de la cohorte (= cohort_end_date).
+    cohort_end_date est déjà cappé par picked_end côté caller (_ltv_cohort_end_date)
+    pour ne pas dépasser la fenêtre sidebar. Ex : cohorte juin avec
+    picked_end=25 juin → cohort_end_date=25 juin → R1 mature le 28 juin.
 
     r_max_obs_override : si fourni, plafonne r_max_obs à cette valeur. Sert au
     calcul "R1 only" (passer 1) qui simule "qu'aurait été la LTV en ne se
@@ -392,15 +411,15 @@ def _ltv_compute(group_data: dict, price_bucket: str,
     if r0 == 0:
         return None
 
-    # Max R observable (worst case = latest user in cohort).
-    # Rn date = cohort_end + trial_days + (n-1) * cycle_days
-    # Rn observable iff cohort_end + trial_days + (n-1)*cycle_days <= today
+    # Max R observable basé sur LATEST user (signup = cohort_end_date).
+    # Rn du latest user = cohort_end + trial_days + (n-1) * cycle_days
+    # Rn obs iff cohort_end + trial_days + (n-1)*cycle_days <= today
     # => n <= 1 + (today - cohort_end - trial_days) / cycle_days
     days_since_end = (today - cohort_end_date).days
     if days_since_end < LTV_TRIAL_DAYS:
         return None  # trial still in flight for latest user
     r_max_obs = 1 + (days_since_end - LTV_TRIAL_DAYS) // cycle_days
-    # funnel_sql now returns R1-R{max_rx_observed} (par défaut 4 pour perf).
+    # funnel_sql now returns R1-R{max_rx_observed} (dynamique côté tab LTV).
     # On cap r_max_obs par le nombre réel de R disponibles dans `rx` (sinon
     # obs_brut[n]=0 pour les R non scannés et la projection part dans le mur).
     rx_keys = group_data.get("rx", {}).keys()
@@ -2681,7 +2700,10 @@ def funnel_graph_data(
                 and c_val in LTV_PRICE_CONFIG:
             _today_g = today or date.today()
             _picked_end_g = picked_end or _today_g
-            # Cohort end = t_key + period span
+            # Cohort end = t_key + period span, CAPPED by picked_end_g.
+            # (Si la sidebar plafonne la fenêtre, le LATEST user de la cohorte
+            # est <= picked_end → permet à la cohorte du mois en cours d'être
+            # mature dès que picked_end est >= trial_days avant today.)
             if time_dim_key == "date_day":
                 _ce = t_key
             elif time_dim_key == "date_week":
@@ -2696,6 +2718,9 @@ def funnel_graph_data(
                     _ce = _picked_end_g
             else:
                 _ce = _picked_end_g
+            # Cap par picked_end (cf. _ltv_cohort_end_date)
+            if _ce is not None and _picked_end_g is not None:
+                _ce = min(_ce, _picked_end_g)
             _gdat = {"r0_succeeded": g0("r0_succeeded"), "rx": agg.get("rx", {})}
             # Sim Total (maturité naturelle) — réel obs R1..r_max_obs + proj
             _sim = _ltv_compute(_gdat, c_val, _ce, _today_g)
