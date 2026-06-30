@@ -1008,7 +1008,7 @@ def _brand_psp_concat(brand_col: str, psp_col: str, mid_alias: str) -> str:
         f"'f6130732-c577-4d1d-9ab9-802900b478a0') THEN 'Kadima' "  # tsyskadimaems = Kadima
         f"WHEN {mid_alias}.MidId = '4a7af99e-20b3-48b3-8e93-6fc39f8012b0' THEN 'Cliq' "
         f"WHEN {mid_alias}.MidId = '9cf8e38c-c719-4d33-a1e3-aaa72cf88cdd' THEN 'CASH' "
-        f"ELSE {psp_col} END"  # MID non déterminé (ex. R0 sans tx) -> gateway 'nmi'
+        f"ELSE 'EMS' END"  # MID NMI non résolu (R0 sans tx, etc.) = EMS (cf. ELA)
     )
     return f"CONCAT({conc}, ' - ', {psp})"
 
