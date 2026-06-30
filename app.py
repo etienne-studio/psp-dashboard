@@ -1822,6 +1822,153 @@ def build_funnel_table(df: pd.DataFrame, brand_type: str, dims: list,
 
 
 # ---------------------------------------------------------------------------
+# LTV tab table — focus R0→R1 leviers + ARPU R1 + LTV simulée
+# ---------------------------------------------------------------------------
+
+def build_ltv_table(df: pd.DataFrame, dims: list,
+                     picked_end: date = None, today: date = None) -> pd.DataFrame:
+    """Pivot le df funnel_sql en table KPI × dim_combo orientée LTV.
+
+    Sections :
+      - R0 / Trial : # R0 Succeeded, % Unsub During Trial
+      - R0 → R1 (leviers) : % R1 Succeeded per User, % Refund R1, % Churn Brut/Net R0/R1
+      - LTV (par R0) : ARPU R1 (€), LTV brute (€), LTV net (€)
+
+    ARPU R1 et LTV en € ne sont calculées que si la dim `price_booking` est
+    sélectionnée (sinon affichage "—").
+    """
+    has_week = any(d[0] in _DATE_DIM_KEYS for d in dims) if dims else False
+    non_week = non_week_dims(dims) if dims else []
+
+    def gk(r):
+        if not dims:
+            return ("Total",)
+        parts = []
+        for d in dims:
+            if d[0] in _DATE_DIM_KEYS:
+                parts.append(str(r["week_label"]))
+            else:
+                parts.append(_safe_str(r.get(f"dim_{d[0]}", "")))
+        return tuple(parts)
+
+    by_group: dict = {}
+    cohort_seen: dict = {}
+    group_sort_key: dict = {}
+
+    for _, r in df.iterrows():
+        g = gk(r)
+        if g not in by_group:
+            by_group[g] = {
+                "r0_attempts": 0, "r0_succeeded": 0, "unsub_trial": 0, "r1_tbb": 0,
+                "rx": {},
+            }
+            cohort_seen[g] = set()
+            sort_parts = []
+            for d in dims or []:
+                if d[0] in _DATE_DIM_KEYS:
+                    sort_parts.append(str(r.get("week_start", "")))
+                else:
+                    sort_parts.append(_safe_str(r.get(f"dim_{d[0]}", "")))
+            group_sort_key[g] = tuple(sort_parts) if sort_parts else g
+
+        cohort_id = (r["week_label"],) + tuple(_safe_str(r.get(f"dim_{d[0]}", "")) for d in non_week)
+        if cohort_id not in cohort_seen[g]:
+            cohort_seen[g].add(cohort_id)
+            by_group[g]["r0_attempts"] += int(r["r0_attempts"])
+            by_group[g]["r0_succeeded"] += int(r["r0_succeeded"])
+            by_group[g]["unsub_trial"] += int(r["unsub_trial"])
+            by_group[g]["r1_tbb"] += int(r["r1_tbb"])
+
+        rx = str(r["rx_idx"])
+        rx_acc = by_group[g]["rx"].setdefault(rx, {
+            "fa_u": 0, "fa_tx": 0, "fa_succ_tx": 0, "total_tx": 0, "succ_tx": 0,
+            "att_u": 0, "succ_u": 0, "refund_tx": 0, "refund_u": 0,
+            "elig_u": 0, "cancel_u": 0,
+        })
+        rx_acc["fa_u"] += int(r["first_attempt_users"])
+        rx_acc["fa_tx"] += int(r["first_attempt_tx"])
+        rx_acc["fa_succ_tx"] += int(r["first_attempt_succ_tx"])
+        rx_acc["total_tx"] += int(r["total_tx"])
+        rx_acc["succ_tx"] += int(r["succ_tx"])
+        rx_acc["att_u"] += int(r["attempted_users"])
+        rx_acc["succ_u"] += int(r["succ_users"])
+        rx_acc["refund_tx"] += int(r["refund_tx"])
+        rx_acc["refund_u"] += int(r["refund_users"])
+        rx_acc["elig_u"] += int(r["tbb_elig_users"])
+        rx_acc["cancel_u"] += int(r["tbb_cancel_users"])
+        rx_acc["tbb"] = max(rx_acc["elig_u"] - rx_acc["cancel_u"], 0)
+
+    groups = sorted(by_group.keys(), key=lambda g: group_sort_key.get(g, g))
+    rows = []
+
+    def push(label, vals, *, section=False):
+        rows.append({"__key__": ("__SECTION__" + label) if section else label,
+                     **{g: v for g, v in zip(groups, vals)}})
+
+    def g0(g, k):
+        return by_group[g][k]
+
+    def gr(g, rx, k):
+        return by_group[g]["rx"].get(rx, {}).get(k, 0)
+
+    # ----- Section R0 / Trial -----
+    push("R0 / Trial", ["" for _ in groups], section=True)
+    push("# R0 Succeeded", [fmt_int(g0(g, "r0_succeeded")) for g in groups])
+    push("% Unsub During Trial",
+         [fmt_pct(g0(g, "unsub_trial"), g0(g, "r0_succeeded")) for g in groups])
+
+    # ----- Section R0 → R1 (leviers) -----
+    push("R0 → R1 (leviers)", ["" for _ in groups], section=True)
+    push("% R1 Succeeded per User",
+         [fmt_pct(gr(g, "1", "succ_u"), gr(g, "1", "att_u")) for g in groups])
+    push("% Refund R1",
+         [fmt_pct(gr(g, "1", "refund_tx"), gr(g, "1", "succ_tx")) for g in groups])
+    push("% Churn Brut R0/R1",
+         [fmt_pct(g0(g, "r0_succeeded") - gr(g, "1", "succ_u"), g0(g, "r0_succeeded")) for g in groups])
+    push("% Churn Net R0/R1",
+         [fmt_pct(g0(g, "r0_succeeded") - (gr(g, "1", "succ_u") - gr(g, "1", "refund_u")),
+                  g0(g, "r0_succeeded")) for g in groups])
+
+    # ----- Section LTV (par R0) -----
+    _today = today or date.today()
+    _picked_end = picked_end or _today
+
+    arpu_r1_vals, ltv_brut_vals, ltv_net_vals = [], [], []
+    for g in groups:
+        price = _ltv_get_price_from_group(g, dims)
+        r0 = g0(g, "r0_succeeded")
+        if price is None or r0 == 0:
+            arpu_r1_vals.append("—")
+            ltv_brut_vals.append("—")
+            ltv_net_vals.append("—")
+            continue
+        amount = LTV_PRICE_CONFIG[price][2]
+        r1_net = gr(g, "1", "succ_u") - gr(g, "1", "refund_u")
+        arpu_r1 = (r1_net / r0) * amount
+        arpu_r1_vals.append(_ltv_fmt_eur(arpu_r1))
+
+        sort_key = group_sort_key.get(g, g)
+        cohort_end = _ltv_cohort_end_date(sort_key, dims, _picked_end)
+        sim = _ltv_compute(by_group[g], price, cohort_end, _today)
+        if sim is None:
+            ltv_brut_vals.append("—")
+            ltv_net_vals.append("—")
+        else:
+            ltv_brut_vals.append(_ltv_fmt_eur(sim["ltv_brut_eur"]))
+            ltv_net_vals.append(_ltv_fmt_eur(sim["ltv_net_eur"]))
+
+    push("LTV (par R0)", ["" for _ in groups], section=True)
+    push("ARPU R1 (€)", arpu_r1_vals)
+    push("LTV brute (€)", ltv_brut_vals)
+    push("LTV net (€)", ltv_net_vals)
+
+    out = pd.DataFrame(rows)
+    out.attrs["dims"] = dims
+    out.attrs["groups"] = groups
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Funnel graph — same data as build_funnel_table but pivoted for plotting.
 #
 # Each "point" on the graph = one (time bucket, curve dim value) cell, which
@@ -1935,11 +2082,39 @@ for _rx in ["2", "3", "4"]:
     ]))
 
 FUNNEL_KPI_SECTIONS.append(("LTV Simulator", [
+    "ARPU R1 (€)",
     "ARPU brute (€)",
     "ARPU net (€)",
     "LTV brute (€)",
     "LTV net (€)",
 ]))
+
+# Ajouter ARPU R1 (€) dans la liste plate
+if "ARPU R1 (€)" not in ALL_FUNNEL_KPIS:
+    ALL_FUNNEL_KPIS.append("ARPU R1 (€)")
+
+
+# ---------------------------------------------------------------------------
+# LTV tab — KPI sections (sous-ensemble du Funnel Booking + ARPU R1)
+# ---------------------------------------------------------------------------
+LTV_KPI_SECTIONS = [
+    ("R0 / Trial", [
+        "# R0 Succeeded",
+        "% Unsub During Trial",
+    ]),
+    ("R0 → R1 (leviers)", [
+        "% R1 Succeeded per User",
+        "% Refund R1",
+        "% Churn Brut R0/R1",
+        "% Churn Net R0/R1",
+    ]),
+    ("LTV (par R0)", [
+        "ARPU R1 (€)",
+        "LTV brute (€)",
+        "LTV net (€)",
+    ]),
+]
+ALL_LTV_KPIS = [k for _, kpis in LTV_KPI_SECTIONS for k in kpis]
 
 
 # ---------------------------------------------------------------------------
@@ -2432,6 +2607,12 @@ def funnel_graph_data(
                 kpis["ARPU net (€)"]   = _sim["arpu_net_eur"]
                 kpis["LTV brute (€)"]  = _sim["ltv_brut_eur"]
                 kpis["LTV net (€)"]    = _sim["ltv_net_eur"]
+            # ARPU R1 = R1 NET users × prix / R0 (= revenue NET R1 par R0)
+            _arpt = LTV_PRICE_CONFIG[c_val][2]
+            _r0 = g0("r0_succeeded")
+            if _r0 > 0:
+                _r1_net = gr("1", "succ_u") - gr("1", "refund_u")
+                kpis["ARPU R1 (€)"] = (_r1_net / _r0) * _arpt
 
         t_label = cell_labels[(t_key, c_val)]
         for kpi_name, val in kpis.items():
@@ -2446,7 +2627,8 @@ def funnel_graph_data(
     return pd.DataFrame(rows)
 
 
-def render_funnel_graph(brand_type: str, filters: dict, picked_start, picked_end, key_prefix: str) -> None:
+def render_funnel_graph(brand_type: str, filters: dict, picked_start, picked_end, key_prefix: str,
+                         kpi_sections: list = None, all_kpis: list = None) -> None:
     """Render the "Évolution dans le temps" graph section under a funnel tab.
 
     Layout mirrors the funnel TABLE structure:
@@ -2464,6 +2646,10 @@ def render_funnel_graph(brand_type: str, filters: dict, picked_start, picked_end
     `min_denom_for_ratios` argument in funnel_graph_data.
     """
     import plotly.express as px  # lazy import — only when graph is rendered
+
+    # Allow custom KPI sections/list (used by LTV tab to filter only LTV KPIs)
+    _kpi_sections = kpi_sections if kpi_sections is not None else FUNNEL_KPI_SECTIONS
+    _all_kpis = all_kpis if all_kpis is not None else ALL_FUNNEL_KPIS
 
     st.markdown("### 📈 Évolution dans le temps")
 
@@ -2541,7 +2727,7 @@ def render_funnel_graph(brand_type: str, filters: dict, picked_start, picked_end
         elif "# R0 Attempts" in available:
             st.session_state[state_key] = "# R0 Attempts"
         else:
-            ordered_available = [k for k in ALL_FUNNEL_KPIS if k in available]
+            ordered_available = [k for k in _all_kpis if k in available]
             st.session_state[state_key] = ordered_available[0] if ordered_available else None
 
     # --- Scoped CSS so KPI buttons look like compact radio entries -----------
@@ -2595,7 +2781,7 @@ def render_funnel_graph(brand_type: str, filters: dict, picked_start, picked_end
     with col_kpi:
         st.markdown('<div class="psp-kpi-buttons">', unsafe_allow_html=True)
         with st.container(height=520, border=False):
-            for section_name, section_kpis in FUNNEL_KPI_SECTIONS:
+            for section_name, section_kpis in _kpi_sections:
                 visible_kpis = [k for k in section_kpis if k in available]
                 if not visible_kpis:
                     continue
@@ -4978,13 +5164,13 @@ st.caption("Funnel + VAMP — basé sur le skill `weekly-psp-report` (v3) — di
 st.sidebar.header("Page")
 _PAGES = ["Executive Summary", "Exec par PSP — Trimestre", "Executive Summary Billing",
           "Exec Billing par PSP — Trimestre",
-          "Funnel Booking", "Funnel Magazine", "VAMP Cohort", "VAMP Date", "Analyse A/B"]
+          "Funnel Booking", "Funnel Magazine", "LTV", "VAMP Cohort", "VAMP Date", "Analyse A/B"]
 page = st.sidebar.radio("Aller à", _PAGES, index=0, key="page_nav",
                         label_visibility="collapsed")
 st.sidebar.divider()
 
 # Pages qui ont besoin des contrôles funnel (dates / dimensions / filtres).
-_FUNNEL_PAGES = {"Funnel Booking", "Funnel Magazine", "VAMP Cohort", "VAMP Date"}
+_FUNNEL_PAGES = {"Funnel Booking", "Funnel Magazine", "LTV", "VAMP Cohort", "VAMP Date"}
 _needs_controls = page in _FUNNEL_PAGES
 
 # Defaults (utilisés quand la page n'utilise pas la sidebar funnel)
@@ -5543,6 +5729,27 @@ elif page == "Funnel Magazine":
     # sidebar filters + date range.
     st.divider()
     render_funnel_graph("Magazine", filters, _picked_start, _picked_end, key_prefix="magazine")
+
+elif page == "LTV":
+    st.caption(
+        "Décompo R0→R1 + ARPU R1 + LTV simulée (Booking only). "
+        "ARPU R1 et LTV en € nécessitent la dim **Prix Booking** (sinon affichage « — »). "
+        "LTV simulée = R observés + projection via decay factors hardcodés (cohortes déc 2025)."
+    )
+    with st.spinner("LTV…"):
+        try:
+            df = run_query(funnel_sql("Booking", filters, dims, weeks_list))
+            table = build_ltv_table(df, dims, picked_end=_picked_end)
+            st.markdown(render_table_html(table), unsafe_allow_html=True)
+        except Exception as e:
+            st.error(f"Erreur LTV : {e}")
+    # Graph section under the table — réutilise render_funnel_graph avec
+    # les sections KPI propres à la LTV.
+    st.divider()
+    render_funnel_graph(
+        "Booking", filters, _picked_start, _picked_end, key_prefix="ltv",
+        kpi_sections=LTV_KPI_SECTIONS, all_kpis=ALL_LTV_KPIS,
+    )
 
 elif page == "VAMP Cohort":
     with st.spinner("VAMP Cohort…"):
