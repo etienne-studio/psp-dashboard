@@ -298,6 +298,30 @@ LTV_DEFAULT_DECAY = 0.9  # appliqué au-delà du dernier R observé en référen
 MIN_R0_DISPLAY = 200
 
 
+def _dynamic_max_rx_observed(weeks_list, today=None,
+                              min_cycle_days: int = 14,
+                              default: int = 4, hard_cap: int = 26) -> int:
+    """Calcule max_rx_observed à demander au funnel_sql selon la fenêtre.
+
+    Pour le tab LTV (et le simulator LTV dans Funnel Booking), on a besoin
+    d'observer tous les R où la cohorte est mature (pour calculer ARPU réel +
+    démarrer le decay au bon endroit).
+
+    Cycle de référence = 14j (bimensuel €19, le plus court = + de R observables
+    sur la même fenêtre). Si la cohorte est en €49 (cycle 30j) on sur-estime
+    (= demande plus de R que strictement nécessaire) sans impact correctness.
+
+    weeks_list[0] = début de la plus ancienne cohorte de la fenêtre.
+    """
+    if not weeks_list:
+        return default
+    today = today or date.today()
+    earliest_start = min(weeks_list)
+    days_since = (today - earliest_start).days
+    r_max = 1 + (days_since - LTV_TRIAL_DAYS) // min_cycle_days
+    return max(default, min(hard_cap, r_max))
+
+
 def _ltv_fmt_eur(amount) -> str:
     """Format FR : 1 234,56 €."""
     if amount is None:
@@ -2719,7 +2743,8 @@ def funnel_graph_data(
 
 def render_funnel_graph(brand_type: str, filters: dict, picked_start, picked_end, key_prefix: str,
                          kpi_sections: list = None, all_kpis: list = None,
-                         max_rx: int = 4) -> None:
+                         max_rx: int = 4,
+                         max_rx_observed_dynamic: bool = False) -> None:
     """Render the "Évolution dans le temps" graph section under a funnel tab.
 
     Layout mirrors the funnel TABLE structure:
@@ -2782,7 +2807,14 @@ def render_funnel_graph(brand_type: str, filters: dict, picked_start, picked_end
     # --- Data fetch ----------------------------------------------------------
     with st.spinner("Graphe…"):
         try:
-            raw_df = run_query(funnel_sql(brand_type, filters, graph_dims_list, graph_weeks_list, max_rx=max_rx))
+            _gmax_rx_obs = (
+                _dynamic_max_rx_observed(graph_weeks_list, today=date.today())
+                if max_rx_observed_dynamic else 4
+            )
+            raw_df = run_query(funnel_sql(
+                brand_type, filters, graph_dims_list, graph_weeks_list,
+                max_rx=max_rx, max_rx_observed=_gmax_rx_obs,
+            ))
             graph_df = funnel_graph_data(
                 raw_df, graph_time_dim[0], curve_key,
                 picked_end=picked_end, brand_type=brand_type,
@@ -5831,9 +5863,17 @@ elif page == "LTV":
         try:
             # Tab LTV n'utilise pas les KPI TBB (% Billed / # To Be Billed) → on
             # passe max_rx=2 pour skip les CTEs r3_tbb_raw/r4_tbb_raw (jointures
-            # stg_memberships coûteuses). max_rx_observed=4 conserve rx_stats
-            # R1-R4 (utilisés pour ARPU + projection LTV).
-            df = run_query(funnel_sql("Booking", filters, dims, weeks_list, max_rx=2))
+            # stg_memberships coûteuses).
+            # max_rx_observed dynamique : on demande au SQL tous les R où la
+            # cohorte la plus ancienne de la fenêtre est encore mature (cycle
+            # ref = 14j bimensuel). Permet à _ltv_compute d'utiliser le R réel
+            # max observé (ex: R13 pour cohorte déc 2025 €19) au lieu d'être
+            # plafonné à R4 par défaut.
+            _ltv_max_rx_obs = _dynamic_max_rx_observed(weeks_list, today=date.today())
+            df = run_query(funnel_sql(
+                "Booking", filters, dims, weeks_list,
+                max_rx=2, max_rx_observed=_ltv_max_rx_obs,
+            ))
             table = build_ltv_table(df, dims, picked_end=_picked_end)
             st.markdown(render_table_html(table), unsafe_allow_html=True)
         except Exception as e:
@@ -5844,7 +5884,7 @@ elif page == "LTV":
     render_funnel_graph(
         "Booking", filters, _picked_start, _picked_end, key_prefix="ltv",
         kpi_sections=LTV_KPI_SECTIONS, all_kpis=ALL_LTV_KPIS,
-        max_rx=2,
+        max_rx=2, max_rx_observed_dynamic=True,
     )
 
 elif page == "VAMP Cohort":
