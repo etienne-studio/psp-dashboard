@@ -2940,7 +2940,7 @@ _EXEC_CONC_ORDER = ["Reserv-Go", "Book-Ici", "Resadexa", "Concimax",
 _EXEC_PSP_LABELS = {
     "trustpayment": "Trustpayment", "pixxles": "Pixxles",
     "labanquepostale": "La Banque Postale", "emerchantpay": "eMerchantPay",
-    "EMS": "EMS", "Kadima": "Kadima", "autres": "NMI autres",
+    "EMS": "EMS", "Kadima": "Kadima", "Cliq": "Cliq", "CASH": "CASH",
 }
 _EXEC_BRUT_MIN = 10000.0  # une colonne s'affiche si brut s1 >= ce seuil (€ encaissés)
 
@@ -3013,14 +3013,17 @@ _EXEC_BASE_CSS = """
 
 
 def _exec_psp_reel(psp_col: str, mid_alias: str) -> str:
-    """PSP réel COLLAPSÉ pour l'Exec : hors NMI = ms_default_psp ; NMI = EMS /
-    Kadima / 'autres' (Cliq+CASH+nmi regroupés). MidId du R0 via {mid_alias}."""
+    """PSP réel pour l'Exec = même découpage que la dimension brand_psp : hors NMI
+    = ms_default_psp ; NMI = EMS / Kadima / Cliq / CASH selon le MidId du R0. Le
+    fallback NMI (MidId non résolu) = EMS (cf. ELA). Plus de bucket 'autres'."""
     return (
         f"CASE WHEN {psp_col} <> 'nmi' THEN {psp_col} "
         f"WHEN {mid_alias}.MidId = '688b5f4e-4f33-4b16-b2c7-6c601ba15306' THEN 'EMS' "
         f"WHEN {mid_alias}.MidId IN ('5f915cec-f0b3-40e9-9908-b3590b791448', "
         f"'f6130732-c577-4d1d-9ab9-802900b478a0') THEN 'Kadima' "
-        f"ELSE 'autres' END"
+        f"WHEN {mid_alias}.MidId = '4a7af99e-20b3-48b3-8e93-6fc39f8012b0' THEN 'Cliq' "
+        f"WHEN {mid_alias}.MidId = '9cf8e38c-c719-4d33-a1e3-aaa72cf88cdd' THEN 'CASH' "
+        f"ELSE 'EMS' END"
     )
 
 
@@ -3122,7 +3125,7 @@ def exec_summary_sql(period_start: date, period_end: date) -> str:
     fm_conc = _conc("fm", "brand")
     ft_conc = _conc("ft", "t_brand")
     t_conc  = _conc("t",  "t_brand")
-    # PSP réel collapsé (NMI -> EMS/Kadima/autres via MidId du R0). Alias 'rm'.
+    # PSP réel (NMI -> EMS/Kadima/Cliq/CASH via MidId du R0). Alias 'rm'.
     psp_fm = _exec_psp_reel("fm.ms_default_psp", "rm")
     psp_ft = _exec_psp_reel("ft.ms_default_psp", "rm")
     psp_t  = _exec_psp_reel("t.ms_default_psp",  "rm")
@@ -3145,7 +3148,7 @@ WITH weeks_def AS (
 ),
 r0_mid_map AS (
   -- MidId du R0 NMI par membership (borné sur la fenêtre exec). Sert à
-  -- résoudre le PSP réel (EMS/Kadima/autres) pour le NMI.
+  -- résoudre le PSP réel (EMS/Kadima/Cliq/CASH) pour le NMI.
   SELECT f.membership_id, ANY_VALUE(s.MidId) AS MidId
   FROM `eu-andy-marketing-raw.dashboard.fact_transactions` f
   JOIN `eu-andy-marketing-raw.silver_sgw.stg_transactions` s ON f.transaction_id = s.Id
