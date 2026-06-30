@@ -292,6 +292,11 @@ LTV_PRICE_CONFIG = {
 LTV_TRIAL_DAYS = 3
 LTV_DEFAULT_DECAY = 0.9  # appliqué au-delà du dernier R observé en référence
 
+# Seuil de masquage des cohortes trop petites (colonnes du tableau + points de
+# courbe). Les cohortes avec moins de N R0 succeeded sont masquées (manque de
+# significativité statistique).
+MIN_R0_DISPLAY = 200
+
 
 def _ltv_fmt_eur(amount) -> str:
     """Format FR : 1 234,56 €."""
@@ -342,10 +347,18 @@ def _ltv_cohort_end_date(group_sort_key_tuple: tuple, dims: list,
 
 
 def _ltv_compute(group_data: dict, price_bucket: str,
-                  cohort_end_date: date, today: date) -> dict:
+                  cohort_end_date: date, today: date,
+                  r_max_obs_override: int = None) -> dict:
     """Compute ARPU + LTV brut/net for one cohort group.
-    Returns dict with keys arpu_eur, ltv_brut_eur, ltv_net_eur, r_max_obs,
-    or None if not computable (no R0, no observation possible)."""
+
+    Returns dict with keys arpu_brut_eur, arpu_net_eur, ltv_brut_eur,
+    ltv_net_eur, r_max_obs, or None if not computable.
+
+    r_max_obs_override : si fourni, plafonne r_max_obs à cette valeur. Sert au
+    calcul "R1 only" (passer 1) qui simule "qu'aurait été la LTV en ne se
+    basant que sur R1 observé + projection R2+ via decay" — utile pour comparer
+    avec la version mature (qui observe R1..r_max_obs_natural).
+    """
     if price_bucket not in LTV_PRICE_CONFIG:
         return None
     cycle_days, horizon, amount, last_obs_ref, decay_brut, decay_net = \
@@ -369,6 +382,8 @@ def _ltv_compute(group_data: dict, price_bucket: str,
     rx_keys = group_data.get("rx", {}).keys()
     rx_available_max = max((int(k) for k in rx_keys if k.isdigit()), default=0)
     r_max_obs = min(r_max_obs, horizon, rx_available_max if rx_available_max > 0 else 1)
+    if r_max_obs_override is not None:
+        r_max_obs = min(r_max_obs, max(1, r_max_obs_override))
     if r_max_obs < 1:
         return None
 
@@ -1718,7 +1733,9 @@ def build_funnel_table(df: pd.DataFrame, brand_type: str, dims: list,
         rx_acc["cancel_u"] += int(r["tbb_cancel_users"])
         rx_acc["tbb"] = max(rx_acc["elig_u"] - rx_acc["cancel_u"], 0)
 
-    groups = sorted(by_group.keys(), key=lambda g: group_sort_key.get(g, g))
+    # Seuil 200 R0 succeeded — masque les cohortes trop petites
+    groups_all = sorted(by_group.keys(), key=lambda g: group_sort_key.get(g, g))
+    groups = [g for g in groups_all if by_group[g]["r0_succeeded"] >= MIN_R0_DISPLAY]
     rows = []
 
     def push(label: str, vals: Iterable, *, section: bool = False) -> None:
@@ -1908,7 +1925,10 @@ def build_ltv_table(df: pd.DataFrame, dims: list,
         rx_acc["cancel_u"] += int(r["tbb_cancel_users"])
         rx_acc["tbb"] = max(rx_acc["elig_u"] - rx_acc["cancel_u"], 0)
 
-    groups = sorted(by_group.keys(), key=lambda g: group_sort_key.get(g, g))
+    # Filtrage seuil 200 R0 succeeded — on masque les colonnes trop petites
+    # (cohortes sous-significatives → KPI trop bruités).
+    groups_all = sorted(by_group.keys(), key=lambda g: group_sort_key.get(g, g))
+    groups = [g for g in groups_all if by_group[g]["r0_succeeded"] >= MIN_R0_DISPLAY]
     rows = []
 
     def push(label, vals, *, section=False):
@@ -1939,38 +1959,74 @@ def build_ltv_table(df: pd.DataFrame, dims: list,
          [fmt_pct(g0(g, "r0_succeeded") - (gr(g, "1", "succ_u") - gr(g, "1", "refund_u")),
                   g0(g, "r0_succeeded")) for g in groups])
 
-    # ----- Section LTV (par R0) -----
+    # ----- Sections LTV — calcul commun (2 sims par groupe : R1-only + Total) -----
     _today = today or date.today()
     _picked_end = picked_end or _today
 
-    arpu_r1_vals, ltv_brut_vals, ltv_net_vals = [], [], []
+    # Buckets de valeurs par KPI — initialisés vides, remplis si calcul possible
+    arpu_r1_vals, ltv_brut_r1_vals, ltv_net_r1_vals = [], [], []
+    arpu_real_brut_vals, arpu_real_net_vals = [], []
+    ltv_brut_tot_vals, ltv_net_tot_vals = [], []
+
     for g in groups:
         price = _ltv_get_price_from_group(g, dims)
         r0 = g0(g, "r0_succeeded")
         if price is None or r0 == 0:
-            arpu_r1_vals.append("—")
-            ltv_brut_vals.append("—")
-            ltv_net_vals.append("—")
+            for vals in (arpu_r1_vals, ltv_brut_r1_vals, ltv_net_r1_vals,
+                         arpu_real_brut_vals, arpu_real_net_vals,
+                         ltv_brut_tot_vals, ltv_net_tot_vals):
+                vals.append("—")
             continue
-        amount = LTV_PRICE_CONFIG[price][2]
-        r1_net = gr(g, "1", "succ_u") - gr(g, "1", "refund_u")
-        arpu_r1 = (r1_net / r0) * amount
-        arpu_r1_vals.append(_ltv_fmt_eur(arpu_r1))
 
         sort_key = group_sort_key.get(g, g)
         cohort_end = _ltv_cohort_end_date(sort_key, dims, _picked_end)
-        sim = _ltv_compute(by_group[g], price, cohort_end, _today)
-        if sim is None:
-            ltv_brut_vals.append("—")
-            ltv_net_vals.append("—")
-        else:
-            ltv_brut_vals.append(_ltv_fmt_eur(sim["ltv_brut_eur"]))
-            ltv_net_vals.append(_ltv_fmt_eur(sim["ltv_net_eur"]))
 
-    push("LTV (par R0)", ["" for _ in groups], section=True)
+        # Sim 1 : R1-only (force r_max_obs=1) → simule "qu'aurait été la LTV
+        # en ne se basant que sur R1 obs + projection R2+ via decay".
+        sim_r1 = _ltv_compute(by_group[g], price, cohort_end, _today,
+                               r_max_obs_override=1)
+        # Sim 2 : maturité naturelle → R1..r_max_obs observés + projection
+        # depuis r_max_obs+1.
+        sim_tot = _ltv_compute(by_group[g], price, cohort_end, _today)
+
+        # ARPU R1 (€) — calcul direct simple (cohérent avec sim_r1 net R1)
+        amount = LTV_PRICE_CONFIG[price][2]
+        r1_net = gr(g, "1", "succ_u") - gr(g, "1", "refund_u")
+        arpu_r1_vals.append(_ltv_fmt_eur((r1_net / r0) * amount))
+
+        if sim_r1 is not None:
+            ltv_brut_r1_vals.append(_ltv_fmt_eur(sim_r1["ltv_brut_eur"]))
+            ltv_net_r1_vals.append(_ltv_fmt_eur(sim_r1["ltv_net_eur"]))
+        else:
+            ltv_brut_r1_vals.append("—")
+            ltv_net_r1_vals.append("—")
+
+        if sim_tot is not None:
+            # ARPU réel cumulé = observation BRUT/NET sur R1..r_max_obs (= la
+            # part déjà encaissée par R0, sans projection).
+            arpu_real_brut_vals.append(_ltv_fmt_eur(sim_tot["arpu_brut_eur"]))
+            arpu_real_net_vals.append(_ltv_fmt_eur(sim_tot["arpu_net_eur"]))
+            ltv_brut_tot_vals.append(_ltv_fmt_eur(sim_tot["ltv_brut_eur"]))
+            ltv_net_tot_vals.append(_ltv_fmt_eur(sim_tot["ltv_net_eur"]))
+        else:
+            for vals in (arpu_real_brut_vals, arpu_real_net_vals,
+                         ltv_brut_tot_vals, ltv_net_tot_vals):
+                vals.append("—")
+
+    # ----- Section LTV — Projection depuis R1 (naïve) -----
+    push("LTV — Projection depuis R1 (naïve)",
+         ["" for _ in groups], section=True)
     push("ARPU R1 (€)", arpu_r1_vals)
-    push("LTV brute (€)", ltv_brut_vals)
-    push("LTV net (€)", ltv_net_vals)
+    push("LTV brute R1 (€)", ltv_brut_r1_vals)
+    push("LTV nette R1 (€)", ltv_net_r1_vals)
+
+    # ----- Section LTV — Cohorte totale -----
+    push("LTV — Cohorte totale (réel + projection depuis maturité)",
+         ["" for _ in groups], section=True)
+    push("ARPU réel cumulé brut (€)", arpu_real_brut_vals)
+    push("ARPU réel cumulé net (€)", arpu_real_net_vals)
+    push("LTV brute totale (€)", ltv_brut_tot_vals)
+    push("LTV nette totale (€)", ltv_net_tot_vals)
 
     out = pd.DataFrame(rows)
     out.attrs["dims"] = dims
@@ -2118,10 +2174,16 @@ LTV_KPI_SECTIONS = [
         "% Churn Brut R0/R1",
         "% Churn Net R0/R1",
     ]),
-    ("LTV (par R0)", [
+    ("LTV — Projection depuis R1 (naïve)", [
         "ARPU R1 (€)",
-        "LTV brute (€)",
-        "LTV net (€)",
+        "LTV brute R1 (€)",
+        "LTV nette R1 (€)",
+    ]),
+    ("LTV — Cohorte totale (réel + projection depuis maturité)", [
+        "ARPU réel cumulé brut (€)",
+        "ARPU réel cumulé net (€)",
+        "LTV brute totale (€)",
+        "LTV nette totale (€)",
     ]),
 ]
 ALL_LTV_KPIS = [k for _, kpis in LTV_KPI_SECTIONS for k in kpis]
@@ -2611,18 +2673,36 @@ def funnel_graph_data(
             else:
                 _ce = _picked_end_g
             _gdat = {"r0_succeeded": g0("r0_succeeded"), "rx": agg.get("rx", {})}
+            # Sim Total (maturité naturelle) — réel obs R1..r_max_obs + proj
             _sim = _ltv_compute(_gdat, c_val, _ce, _today_g)
             if _sim is not None:
+                # Anciens noms (compat Funnel Booking)
                 kpis["ARPU brute (€)"] = _sim["arpu_brut_eur"]
                 kpis["ARPU net (€)"]   = _sim["arpu_net_eur"]
                 kpis["LTV brute (€)"]  = _sim["ltv_brut_eur"]
                 kpis["LTV net (€)"]    = _sim["ltv_net_eur"]
+                # Nouveaux noms (tab LTV — section Cohorte totale)
+                kpis["ARPU réel cumulé brut (€)"] = _sim["arpu_brut_eur"]
+                kpis["ARPU réel cumulé net (€)"]  = _sim["arpu_net_eur"]
+                kpis["LTV brute totale (€)"]      = _sim["ltv_brut_eur"]
+                kpis["LTV nette totale (€)"]      = _sim["ltv_net_eur"]
+            # Sim R1-only (force r_max_obs=1) — projection naïve depuis R1
+            _sim_r1 = _ltv_compute(_gdat, c_val, _ce, _today_g,
+                                    r_max_obs_override=1)
+            if _sim_r1 is not None:
+                kpis["LTV brute R1 (€)"] = _sim_r1["ltv_brut_eur"]
+                kpis["LTV nette R1 (€)"] = _sim_r1["ltv_net_eur"]
             # ARPU R1 = R1 NET users × prix / R0 (= revenue NET R1 par R0)
             _arpt = LTV_PRICE_CONFIG[c_val][2]
             _r0 = g0("r0_succeeded")
             if _r0 > 0:
                 _r1_net = gr("1", "succ_u") - gr("1", "refund_u")
                 kpis["ARPU R1 (€)"] = (_r1_net / _r0) * _arpt
+
+        # Seuil 200 R0 — masque toute la cellule (KPI volume ET ratio) si
+        # r0_succeeded < MIN_R0_DISPLAY. value=None → Plotly affiche un trou.
+        if g0("r0_succeeded") < MIN_R0_DISPLAY:
+            kpis = {k: None for k in kpis}
 
         t_label = cell_labels[(t_key, c_val)]
         for kpi_name, val in kpis.items():
