@@ -1415,6 +1415,123 @@ ORDER BY w.week_start, {dim_cols_trailing(dims, "da") if has_nw else ""}rx_idx
 """
 
 
+def ltv_vamp_sql(filters: dict, dims: list, weeks_list: List[date] = None,
+                  picked_end: date = None) -> str:
+    """Query VAMP réels pour le tab LTV.
+
+    Retourne par cohorte × dim :
+      - booking_r1plus_succ    : # tx Booking succeeded R1+ (hors R0)
+      - booking_r1plus_alerted : # tx Booking alerted R1+ (hors R0)
+      - total_succ             : # tx du user (toutes brand_type, toutes Rx)
+      - total_alerted          : # tx alerted du user (toutes)
+
+    Cohorte = R0 Booking succeeded dans la fenêtre (même définition que
+    funnel_sql/bm). Post-signup uniquement (ft.t_date >= c.CreatedAtUtc).
+    Tous types de cartes (pas de filtre cardnetwork='Visa').
+    """
+    granularity = date_dim_key(dims) or "date_week"
+    trunc_arg = _DATE_DIM_TRUNC[granularity]
+    weeks_cte = weeks_cte_sql(weeks_list, granularity, picked_end=picked_end) if weeks_list is not None else WEEKS_CTE
+
+    cp_cte = customer_pool_cte(filters)
+    cp_join_fm = customer_pool_join("fm", filters)
+    cp_price_cte = customer_price_cte(dims)
+    cp_price_join_fm = customer_price_join("fm", dims)
+    bpsp_cte = brand_psp_cte(dims, filters)
+    bpsp_join_fm = brand_psp_join("fm", dims, filters)
+    fm_filter = row_level_filter_clause("fm", filters)
+
+    bm_dim_sel = dim_select_clause("fm", dims)
+    dims_only_trailing = dim_cols_trailing(dims)
+    dims_only = dim_cols_bare(dims)
+    has_nw = bool(non_week_dims(dims))
+    final_dim_select = (
+        ", ".join(f"da.dim_{d[0]} AS dim_{d[0]}" for d in non_week_dims(dims)) + ",\n  "
+        if has_nw
+        else ""
+    )
+    dim_axis_join = "CROSS JOIN dim_axis da\n" if has_nw else ""
+    dim_axis_cte = (
+        f",\ndim_axis AS (\n  SELECT DISTINCT {dims_only} FROM cohort_users\n)"
+        if has_nw
+        else ""
+    )
+    dim_on_stats = dim_join_on("v", "da", dims)
+
+    return f"""
+DECLARE cutoff_ts TIMESTAMP DEFAULT TIMESTAMP(CURRENT_DATE());
+{weeks_cte}{cp_cte}{cp_price_cte}{bpsp_cte},
+cohort_users AS (
+  -- Cohorte Booking R0 succeeded (même définition que bm dans funnel_sql).
+  SELECT DISTINCT
+    DATE_TRUNC(DATE(c.CreatedAtUtc), {trunc_arg}) AS cohort_week,
+{bm_dim_sel}    fm.customer_id,
+    c.CreatedAtUtc AS signup_ts
+  FROM `eu-andy-marketing-raw.dashboard.fact_memberships` fm
+  JOIN `eu-andy-marketing-raw.silver_sgw.stg_customers` c ON fm.customer_id = c.Id
+  JOIN `eu-andy-marketing-raw.silver_sgw.stg_memberships` sm
+    ON CAST(fm.membership_id AS STRING) = CAST(sm.Id AS STRING)
+  {cp_join_fm}
+  {cp_price_join_fm}
+  {bpsp_join_fm}
+  CROSS JOIN window_bounds wb
+  WHERE DATE(c.CreatedAtUtc) BETWEEN wb.ws_min AND wb.ws_max
+    AND DATE_TRUNC(DATE(c.CreatedAtUtc), {trunc_arg}) IN (SELECT week_start FROM weeks)
+    AND fm.brand_type = 'Booking'
+    AND fm.brand != 'helpprio.com'
+    AND fm.ms_status NOT IN ('abandonned','processing','paused')
+    AND LOWER(fm.customer_email) NOT LIKE '%@yopmail%'
+    AND LOWER(fm.customer_email) NOT LIKE '%@sharebot%'
+    AND LOWER(fm.customer_firstname) NOT LIKE '%test%'
+    AND NOT (sm.Segment = 'unknown' AND sm.Country = '' AND sm.Language = '')
+    {fm_filter}
+){dim_axis_cte},
+alerted_tx AS (
+  -- fact_alert VIEW : exclut déjà Order Insight. Tous types de cartes (pas
+  -- de filtre Visa car ELA demande all-card VAMP dans le tab LTV).
+  SELECT DISTINCT fa.transaction_id
+  FROM `eu-andy-marketing-raw.dashboard.fact_alert` fa
+),
+tx_enriched AS (
+  -- Post-signup uniquement (ft.t_date >= DATE(cu.signup_ts)). Toutes tx
+  -- succeeded du customer (toutes brand_type, tous R index).
+  SELECT
+    cu.cohort_week, {dims_only_trailing}
+    ft.brand_type,
+    SAFE_CAST(ft.invoice_r_index AS INT64) AS r_idx,
+    ft.transaction_id,
+    CASE WHEN al.transaction_id IS NOT NULL THEN 1 ELSE 0 END AS is_alert
+  FROM cohort_users cu
+  JOIN `eu-andy-marketing-raw.dashboard.fact_transactions` ft
+    ON ft.customer_id = cu.customer_id
+  LEFT JOIN alerted_tx al ON al.transaction_id = ft.transaction_id
+  WHERE ft.transaction_status = 'succeeded'
+    AND ft.t_date >= DATE(cu.signup_ts)
+    AND ft.t_date <= CURRENT_DATE()
+),
+vamp_stats AS (
+  SELECT
+    cohort_week, {dims_only_trailing}
+    COUNTIF(brand_type='Booking' AND r_idx >= 1) AS booking_r1plus_succ,
+    SUM(CASE WHEN brand_type='Booking' AND r_idx >= 1 THEN is_alert ELSE 0 END) AS booking_r1plus_alerted,
+    COUNT(*) AS total_succ,
+    SUM(is_alert) AS total_alerted
+  FROM tx_enriched
+  GROUP BY ALL
+)
+SELECT
+  FORMAT_DATE('%Y-%m-%d', w.week_start) AS week_start,
+  w.week_label,
+  {final_dim_select}COALESCE(v.booking_r1plus_succ, 0)    AS booking_r1plus_succ,
+  COALESCE(v.booking_r1plus_alerted, 0) AS booking_r1plus_alerted,
+  COALESCE(v.total_succ, 0)             AS total_succ,
+  COALESCE(v.total_alerted, 0)          AS total_alerted
+FROM weeks w
+{dim_axis_join}LEFT JOIN vamp_stats v ON v.cohort_week = w.week_start{dim_on_stats}
+ORDER BY w.week_start{", " + dim_cols_trailing(dims, "da").rstrip(", ") if has_nw else ""}
+"""
+
+
 def vamp_cohort_sql(filters: dict, dims: list, weeks_list: List[date] = None,
                      picked_end: date = None) -> str:
     granularity = date_dim_key(dims) or "date_week"
@@ -1908,7 +2025,8 @@ def build_funnel_table(df: pd.DataFrame, brand_type: str, dims: list,
 # ---------------------------------------------------------------------------
 
 def build_ltv_table(df: pd.DataFrame, dims: list,
-                     picked_end: date = None, today: date = None) -> pd.DataFrame:
+                     picked_end: date = None, today: date = None,
+                     df_vamp: pd.DataFrame = None) -> pd.DataFrame:
     """Pivot le df funnel_sql en table KPI × dim_combo orientée LTV.
 
     Sections :
@@ -1979,6 +2097,21 @@ def build_ltv_table(df: pd.DataFrame, dims: list,
         rx_acc["elig_u"] += int(r["tbb_elig_users"])
         rx_acc["cancel_u"] += int(r["tbb_cancel_users"])
         rx_acc["tbb"] = max(rx_acc["elig_u"] - rx_acc["cancel_u"], 0)
+
+    # Agrégation VAMP réels par groupe (df_vamp facultatif : si absent, on
+    # laisse "—" sur les 2 lignes VAMP réels).
+    vamp_by_group: dict = {}
+    if df_vamp is not None and not df_vamp.empty:
+        for _, r in df_vamp.iterrows():
+            g = gk(r)
+            v = vamp_by_group.setdefault(g, {
+                "booking_r1plus_succ": 0, "booking_r1plus_alerted": 0,
+                "total_succ": 0, "total_alerted": 0,
+            })
+            v["booking_r1plus_succ"]    += int(r.get("booking_r1plus_succ", 0) or 0)
+            v["booking_r1plus_alerted"] += int(r.get("booking_r1plus_alerted", 0) or 0)
+            v["total_succ"]             += int(r.get("total_succ", 0) or 0)
+            v["total_alerted"]          += int(r.get("total_alerted", 0) or 0)
 
     # Filtrage seuil 200 R0 succeeded — on masque les colonnes trop petites
     # (cohortes sous-significatives → KPI trop bruités).
@@ -2079,9 +2212,17 @@ def build_ltv_table(df: pd.DataFrame, dims: list,
     push("Réel", ["" for _ in groups], section=True)
     push("ARPU R1 (€)", arpu_r1_vals)
     push("ARPU Total (€)", arpu_total_vals)
-    # VAMP réels : à implémenter dans un prochain commit (SQL alerts / tx succeeded)
-    push("Vamp Ratio - Abo Booking Only", ["—" for _ in groups])
-    push("VAMP Ratio - Total", ["—" for _ in groups])
+
+    def _vamp_ratio(g, num_key, den_key):
+        v = vamp_by_group.get(g)
+        if v is None:
+            return "—"
+        return fmt_pct(v[num_key], v[den_key])
+
+    push("Vamp Ratio - Abo Booking Only",
+         [_vamp_ratio(g, "booking_r1plus_alerted", "booking_r1plus_succ") for g in groups])
+    push("VAMP Ratio - Total",
+         [_vamp_ratio(g, "total_alerted", "total_succ") for g in groups])
 
     # =====================================================================
     # Section "Projection" (LTV + VAMP projetés via decay)
@@ -5924,7 +6065,12 @@ elif page == "LTV":
                 max_rx=2, max_rx_observed=_ltv_max_rx_obs,
                 picked_end=_picked_end,
             ))
-            table = build_ltv_table(df, dims, picked_end=_picked_end)
+            # VAMP réels — query séparée (cohorte Booking R0 + toutes tx du user)
+            df_vamp = run_query(ltv_vamp_sql(
+                filters, dims, weeks_list, picked_end=_picked_end,
+            ))
+            table = build_ltv_table(df, dims, picked_end=_picked_end,
+                                     df_vamp=df_vamp)
             st.markdown(render_table_html(table), unsafe_allow_html=True)
         except Exception as e:
             st.error(f"Erreur LTV : {e}")
