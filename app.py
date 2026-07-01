@@ -4453,16 +4453,18 @@ def render_exec_quarter(df: pd.DataFrame, period_start: date, period_end: date) 
                  border-radius:4px; margin-bottom:12px; font-size:13px; }
       table.eq { border-collapse: separate; border-spacing: 0; background:white;
                  border:1px solid #cbd5e1; border-radius:8px; overflow:hidden; }
-      table.eq th, table.eq td { padding:8px 12px; text-align:center; white-space:nowrap; }
+      table.eq th, table.eq td { padding:8px 12px; text-align:center; white-space:nowrap;
+                                 border-right:1px solid #eef1f5; }
       table.eq thead th { background:#0f172a; color:white; font-weight:600;
                           position:sticky; top:0; }
-      th.eq-grp { border-left:2px solid #334155; font-size:13px; }
+      /* Séparation nette ENTRE PSP : trait épais foncé au bord des groupes. */
+      th.eq-grp { border-left:3px solid #0f172a; font-size:13px; }
       th.eq-mo { background:#1e293b; color:#cbd5e1; font-weight:500; font-size:12px; }
       th.eq-kpi, td.eq-kpi { text-align:left; position:sticky; left:0; z-index:1;
                              background:#1e293b; color:white; font-weight:600; min-width:200px; }
-      td.eq-kpi { background:#f8fafc; color:#0f172a; }
+      td.eq-kpi { background:#f8fafc; color:#0f172a; border-right:2px solid #cbd5e1; }
       td.eq-val { color:#0f172a; min-width:78px; }
-      td.eq-bound { border-right:2px solid #cbd5e1; }
+      td.eq-bound { border-right:3px solid #64748b !important; }
       .eq-total { background:#f1f5f9; font-weight:700; }
       th.eq-total { background:#1e293b; }
       tbody tr:nth-child(even) td.eq-val { background:#fbfcfe; }
