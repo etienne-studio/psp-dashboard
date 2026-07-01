@@ -4423,21 +4423,21 @@ def render_exec_quarter(df: pd.DataFrame, period_start: date, period_end: date) 
     h1 += "<th colspan='3' class='eq-grp eq-total'>Total</th>"
     h2 = ""
     for _ in shown:
-        for _b, lbl in buckets:
-            h2 += f"<th class='eq-mo'>{lbl}</th>"
-    for _b, lbl in buckets:
-        h2 += f"<th class='eq-mo eq-total'>{lbl}</th>"
+        for j, (_b, lbl) in enumerate(buckets):
+            h2 += f"<th class='eq-mo{' eq-gsep' if j == 0 else ''}'>{lbl}</th>"
+    for j, (_b, lbl) in enumerate(buckets):
+        h2 += f"<th class='eq-mo eq-total{' eq-gsep' if j == 0 else ''}'>{lbl}</th>"
 
     body = ""
     for label, fn, tfn in kpis:
         cells = ""
         for i, p in enumerate(shown):
             for j, (b, _l) in enumerate(buckets):
-                bnd = " eq-bound" if j == 2 else ""
-                cells += f"<td class='eq-val{bnd}'>{fn(p, b)}</td>"
+                gs = " eq-gsep" if j == 0 else ""
+                cells += f"<td class='eq-val{gs}'>{fn(p, b)}</td>"
         for j, (b, _l) in enumerate(buckets):
-            bnd = " eq-bound" if j == 2 else ""
-            cells += f"<td class='eq-val eq-total{bnd}'>{tfn(b)}</td>"
+            gs = " eq-gsep" if j == 0 else ""
+            cells += f"<td class='eq-val eq-total{gs}'>{tfn(b)}</td>"
         body += f"<tr><td class='eq-kpi'>{label}</td>{cells}</tr>"
 
     is_mtd = period_end < _last_day_of_month(period_start)
@@ -4457,14 +4457,15 @@ def render_exec_quarter(df: pd.DataFrame, period_start: date, period_end: date) 
                                  border-right:1px solid #eef1f5; }
       table.eq thead th { background:#0f172a; color:white; font-weight:600;
                           position:sticky; top:0; }
-      /* Séparation nette ENTRE PSP : trait épais foncé au bord des groupes. */
-      th.eq-grp { border-left:3px solid #0f172a; font-size:13px; }
+      /* Séparation nette ENTRE PSP : bordure gauche continue (en-tête + lignes)
+         au début de chaque bloc PSP -> une seule ligne verticale nette. */
+      th.eq-grp { border-left:3px solid #334155; font-size:13px; }
+      th.eq-gsep, td.eq-gsep { border-left:3px solid #334155 !important; }
       th.eq-mo { background:#1e293b; color:#cbd5e1; font-weight:500; font-size:12px; }
       th.eq-kpi, td.eq-kpi { text-align:left; position:sticky; left:0; z-index:1;
                              background:#1e293b; color:white; font-weight:600; min-width:200px; }
       td.eq-kpi { background:#f8fafc; color:#0f172a; border-right:2px solid #cbd5e1; }
       td.eq-val { color:#0f172a; min-width:78px; }
-      td.eq-bound { border-right:3px solid #64748b !important; }
       .eq-total { background:#f1f5f9; font-weight:700; }
       th.eq-total { background:#1e293b; }
       tbody tr:nth-child(even) td.eq-val { background:#fbfcfe; }
@@ -4868,10 +4869,10 @@ def render_exec_billing_quarter(df: pd.DataFrame, period_start: date,
     h1 += "<th colspan='3' class='eqb-grp eqb-total'>Total</th>"
     h2 = ""
     for _ in shown:
-        for _b, lbl in buckets:
-            h2 += f"<th class='eqb-mo'>{lbl}</th>"
-    for _b, lbl in buckets:
-        h2 += f"<th class='eqb-mo eqb-total'>{lbl}</th>"
+        for j, (_b, lbl) in enumerate(buckets):
+            h2 += f"<th class='eqb-mo{' eqb-gsep' if j == 0 else ''}'>{lbl}</th>"
+    for j, (_b, lbl) in enumerate(buckets):
+        h2 += f"<th class='eqb-mo eqb-total{' eqb-gsep' if j == 0 else ''}'>{lbl}</th>"
 
     body = ""
     for kind, label, fn, fmt, lower in rows:
@@ -4884,10 +4885,10 @@ def render_exec_billing_quarter(df: pd.DataFrame, period_start: date,
         cells = ""
         for p in shown:
             for j, (b, _l) in enumerate(buckets):
-                cells += cell(fn, fmt, lower, [p], b, " eqb-bound" if j == 2 else "")
+                cells += cell(fn, fmt, lower, [p], b, " eqb-gsep" if j == 0 else "")
         for j, (b, _l) in enumerate(buckets):
             cells += cell(fn, fmt, lower, shown, b,
-                          " eqb-total" + (" eqb-bound" if j == 2 else ""))
+                          " eqb-total" + (" eqb-gsep" if j == 0 else ""))
         body += f"<tr><td class='eqb-kpi'>{label}</td>{cells}</tr>"
 
     is_mtd = period_end < _last_day_of_month(period_start)
@@ -4906,8 +4907,10 @@ def render_exec_billing_quarter(df: pd.DataFrame, period_start: date,
       table.eqb th, table.eqb td { padding:8px 12px; text-align:center; white-space:nowrap;
                                    border-right:1px solid #eef1f5; }
       table.eqb thead th { background:#0f172a; color:white; font-weight:600; }
-      /* Séparation nette ENTRE PSP : trait épais foncé au bord des groupes. */
-      th.eqb-grp { border-left:3px solid #0f172a; font-size:13px; }
+      /* Séparation nette ENTRE PSP : bordure gauche continue (en-tête + lignes)
+         au début de chaque bloc PSP -> une seule ligne verticale nette. */
+      th.eqb-grp { border-left:3px solid #334155; font-size:13px; }
+      th.eqb-gsep, td.eqb-gsep { border-left:3px solid #334155 !important; }
       th.eqb-mo { background:#1e293b; color:#cbd5e1; font-weight:500; font-size:12px; }
       th.eqb-kpi, td.eqb-kpi { text-align:left; position:sticky; left:0; z-index:1;
                                min-width:210px; }
@@ -4918,7 +4921,6 @@ def render_exec_billing_quarter(df: pd.DataFrame, period_start: date,
       .eqb-v { font-weight:600; }
       td.eqb-total, th.eqb-total { background:#f1f5f9; }
       th.eqb-total { background:#0b1220; }
-      td.eqb-bound { border-right:3px solid #64748b !important; }
       tr.eqb-sec td { background:#0f172a; color:white; text-transform:uppercase;
                       font-weight:700; text-align:left; letter-spacing:.04em; }
       tr.eqb-sub td { background:#e2e8f0; color:#0f172a; text-align:left;
