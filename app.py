@@ -1996,14 +1996,13 @@ def build_ltv_table(df: pd.DataFrame, dims: list,
     def gr(g, rx, k):
         return by_group[g]["rx"].get(rx, {}).get(k, 0)
 
-    # ----- Section R0 / Trial -----
-    push("R0 / Trial", ["" for _ in groups], section=True)
+    # =====================================================================
+    # Section "Stats Funnel" (R0 / Trial + leviers R0→R1)
+    # =====================================================================
+    push("Stats Funnel", ["" for _ in groups], section=True)
     push("# R0 Succeeded", [fmt_int(g0(g, "r0_succeeded")) for g in groups])
     push("% Unsub During Trial",
          [fmt_pct(g0(g, "unsub_trial"), g0(g, "r0_succeeded")) for g in groups])
-
-    # ----- Section R0 → R1 (leviers) -----
-    push("R0 → R1 (leviers)", ["" for _ in groups], section=True)
     push("% R1 Succeeded per User",
          [fmt_pct(gr(g, "1", "succ_u"), gr(g, "1", "att_u")) for g in groups])
     push("% Refund R1",
@@ -2014,21 +2013,26 @@ def build_ltv_table(df: pd.DataFrame, dims: list,
          [fmt_pct(g0(g, "r0_succeeded") - (gr(g, "1", "succ_u") - gr(g, "1", "refund_u")),
                   g0(g, "r0_succeeded")) for g in groups])
 
-    # ----- Sections LTV — calcul commun (2 sims par groupe : R1-only + Total) -----
+    # =====================================================================
+    # Calcul commun ARPU + LTV (utilisé par les sections Réel + Projection)
+    # =====================================================================
     _today = today or date.today()
     _picked_end = picked_end or _today
 
-    # Buckets de valeurs par KPI — initialisés vides, remplis si calcul possible
-    arpu_r1_vals, ltv_brut_r1_vals, ltv_net_r1_vals = [], [], []
-    arpu_real_brut_vals, arpu_real_net_vals = [], []
+    # ARPU R1 (€) = (R1 NET × prix) / R0
+    # ARPU Total (€) = total revenue NET observé (R1..r_max_obs) / R0
+    # LTV Base R1 brut/net = projection depuis R1 seulement
+    # LTV Base Totale brut/net = observé R1..r_max_obs + projection depuis r_max_obs+1
+    arpu_r1_vals, arpu_total_vals = [], []
+    ltv_brut_r1_vals, ltv_net_r1_vals = [], []
     ltv_brut_tot_vals, ltv_net_tot_vals = [], []
 
     for g in groups:
         price = _ltv_get_price_from_group(g, dims)
         r0 = g0(g, "r0_succeeded")
         if price is None or r0 == 0:
-            for vals in (arpu_r1_vals, ltv_brut_r1_vals, ltv_net_r1_vals,
-                         arpu_real_brut_vals, arpu_real_net_vals,
+            for vals in (arpu_r1_vals, arpu_total_vals,
+                         ltv_brut_r1_vals, ltv_net_r1_vals,
                          ltv_brut_tot_vals, ltv_net_tot_vals):
                 vals.append("—")
             continue
@@ -2036,19 +2040,24 @@ def build_ltv_table(df: pd.DataFrame, dims: list,
         sort_key = group_sort_key.get(g, g)
         cohort_end = _ltv_cohort_end_date(sort_key, dims, _picked_end)
 
-        # Sim 1 : R1-only (force r_max_obs=1) → simule "qu'aurait été la LTV
-        # en ne se basant que sur R1 obs + projection R2+ via decay".
+        # Sim R1-only : force r_max_obs=1 → projection naïve depuis R1
         sim_r1 = _ltv_compute(by_group[g], price, cohort_end, _today,
                                r_max_obs_override=1)
-        # Sim 2 : maturité naturelle → R1..r_max_obs observés + projection
-        # depuis r_max_obs+1.
+        # Sim Total : maturité naturelle → obs R1..r_max_obs + proj r_max_obs+1..horizon
         sim_tot = _ltv_compute(by_group[g], price, cohort_end, _today)
 
-        # ARPU R1 (€) — calcul direct simple (cohérent avec sim_r1 net R1)
+        # ARPU R1 (€) — calcul direct
         amount = LTV_PRICE_CONFIG[price][2]
         r1_net = gr(g, "1", "succ_u") - gr(g, "1", "refund_u")
         arpu_r1_vals.append(_ltv_fmt_eur((r1_net / r0) * amount))
 
+        # ARPU Total (€) — revenue NET observé cumulé / R0
+        if sim_tot is not None:
+            arpu_total_vals.append(_ltv_fmt_eur(sim_tot["arpu_net_eur"]))
+        else:
+            arpu_total_vals.append("—")
+
+        # LTV Base R1
         if sim_r1 is not None:
             ltv_brut_r1_vals.append(_ltv_fmt_eur(sim_r1["ltv_brut_eur"]))
             ltv_net_r1_vals.append(_ltv_fmt_eur(sim_r1["ltv_net_eur"]))
@@ -2056,32 +2065,35 @@ def build_ltv_table(df: pd.DataFrame, dims: list,
             ltv_brut_r1_vals.append("—")
             ltv_net_r1_vals.append("—")
 
+        # LTV Base Totale
         if sim_tot is not None:
-            # ARPU réel cumulé = observation BRUT/NET sur R1..r_max_obs (= la
-            # part déjà encaissée par R0, sans projection).
-            arpu_real_brut_vals.append(_ltv_fmt_eur(sim_tot["arpu_brut_eur"]))
-            arpu_real_net_vals.append(_ltv_fmt_eur(sim_tot["arpu_net_eur"]))
             ltv_brut_tot_vals.append(_ltv_fmt_eur(sim_tot["ltv_brut_eur"]))
             ltv_net_tot_vals.append(_ltv_fmt_eur(sim_tot["ltv_net_eur"]))
         else:
-            for vals in (arpu_real_brut_vals, arpu_real_net_vals,
-                         ltv_brut_tot_vals, ltv_net_tot_vals):
-                vals.append("—")
+            ltv_brut_tot_vals.append("—")
+            ltv_net_tot_vals.append("—")
 
-    # ----- Section LTV — Projection depuis R1 (naïve) -----
-    push("LTV — Projection depuis R1 (naïve)",
-         ["" for _ in groups], section=True)
+    # =====================================================================
+    # Section "Réel" (ARPU + VAMP observés)
+    # =====================================================================
+    push("Réel", ["" for _ in groups], section=True)
     push("ARPU R1 (€)", arpu_r1_vals)
-    push("LTV brute R1 (€)", ltv_brut_r1_vals)
-    push("LTV nette R1 (€)", ltv_net_r1_vals)
+    push("ARPU Total (€)", arpu_total_vals)
+    # VAMP réels : à implémenter dans un prochain commit (SQL alerts / tx succeeded)
+    push("Vamp Ratio - Abo Booking Only", ["—" for _ in groups])
+    push("VAMP Ratio - Total", ["—" for _ in groups])
 
-    # ----- Section LTV — Cohorte totale -----
-    push("LTV — Cohorte totale (réel + projection depuis maturité)",
-         ["" for _ in groups], section=True)
-    push("ARPU réel cumulé brut (€)", arpu_real_brut_vals)
-    push("ARPU réel cumulé net (€)", arpu_real_net_vals)
-    push("LTV brute totale (€)", ltv_brut_tot_vals)
-    push("LTV nette totale (€)", ltv_net_tot_vals)
+    # =====================================================================
+    # Section "Projection" (LTV + VAMP projetés via decay)
+    # =====================================================================
+    push("Projection", ["" for _ in groups], section=True)
+    push("LTV brute - Base R1 (€)", ltv_brut_r1_vals)
+    push("LTV nette - Base R1 (€)", ltv_net_r1_vals)
+    push("LTV brute - Base Totale (€)", ltv_brut_tot_vals)
+    push("LTV nette - Base Totale (€)", ltv_net_tot_vals)
+    # VAMP projetés : à implémenter dans un prochain commit (ratios sheet MTV)
+    push("Vamp Ratio - Abo Booking Only (projeté)", ["—" for _ in groups])
+    push("VAMP Ratio - Total (projeté)", ["—" for _ in groups])
 
     out = pd.DataFrame(rows)
     out.attrs["dims"] = dims
@@ -2219,26 +2231,27 @@ if "ARPU R1 (€)" not in ALL_FUNNEL_KPIS:
 # LTV tab — KPI sections (sous-ensemble du Funnel Booking + ARPU R1)
 # ---------------------------------------------------------------------------
 LTV_KPI_SECTIONS = [
-    ("R0 / Trial", [
+    ("Stats Funnel", [
         "# R0 Succeeded",
         "% Unsub During Trial",
-    ]),
-    ("R0 → R1 (leviers)", [
         "% R1 Succeeded per User",
         "% Refund R1",
         "% Churn Brut R0/R1",
         "% Churn Net R0/R1",
     ]),
-    ("LTV — Projection depuis R1 (naïve)", [
+    ("Réel", [
         "ARPU R1 (€)",
-        "LTV brute R1 (€)",
-        "LTV nette R1 (€)",
+        "ARPU Total (€)",
+        "Vamp Ratio - Abo Booking Only",
+        "VAMP Ratio - Total",
     ]),
-    ("LTV — Cohorte totale (réel + projection depuis maturité)", [
-        "ARPU réel cumulé brut (€)",
-        "ARPU réel cumulé net (€)",
-        "LTV brute totale (€)",
-        "LTV nette totale (€)",
+    ("Projection", [
+        "LTV brute - Base R1 (€)",
+        "LTV nette - Base R1 (€)",
+        "LTV brute - Base Totale (€)",
+        "LTV nette - Base Totale (€)",
+        "Vamp Ratio - Abo Booking Only (projeté)",
+        "VAMP Ratio - Total (projeté)",
     ]),
 ]
 ALL_LTV_KPIS = [k for _, kpis in LTV_KPI_SECTIONS for k in kpis]
