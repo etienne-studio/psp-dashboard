@@ -4809,16 +4809,6 @@ def render_exec_billing_quarter(df: pd.DataFrame, period_start: date,
             return f"{v/1000:,.1f} K€".replace(",", " ").replace(".", ",")
         return f"{v:,.0f} €".replace(",", " ")
 
-    def mom(curr, prev, lower_is_better):
-        if prev is None or curr is None or prev == 0:
-            return "<span class='eqb-mom-neu'>—</span>"
-        pct = (curr - prev) / prev
-        if pct == 0:
-            return "<span class='eqb-mom-neu'>0,0%</span>"
-        good = (pct < 0) if lower_is_better else (pct > 0)
-        cls = "eqb-mom-good" if good else "eqb-mom-bad"
-        sign = "+" if pct > 0 else ""
-        return f"<span class='{cls}'>{sign}{pct*100:.1f}%</span>".replace(".", ",")
 
     # KPI value functions : f(list_of_psps, bucket) -> numeric | None
     def v_brut(ps, b): return asum(ps, b, "ca_brut")
@@ -4867,10 +4857,8 @@ def render_exec_billing_quarter(df: pd.DataFrame, period_start: date,
 
     def cell(fn, fmt, lower, psps, b, extra=""):
         val = fn(psps, b)
-        pv = fn(psps, prev_of[b]) if prev_of[b] else None
         vs = fmt(val) if val is not None else "—"
-        return (f"<td class='eqb-val{extra}'><div class='eqb-v'>{vs}</div>"
-                f"<div class='eqb-m'>{mom(val, pv, lower)}</div></td>")
+        return f"<td class='eqb-val{extra}'><div class='eqb-v'>{vs}</div></td>"
 
     h1 = "<th class='eqb-kpi' rowspan='2'>KPI</th>"
     for p in shown:
@@ -4903,7 +4891,7 @@ def render_exec_billing_quarter(df: pd.DataFrame, period_start: date,
     is_mtd = period_end < _last_day_of_month(period_start)
     sub = (f"Billing agrégé par PSP — trimestre glissant : {_FR_MONTHS[m1s.month]} · "
            f"{_FR_MONTHS[m2s.month]} · {_FR_MONTHS[m3s.month]} {m3s.year}. "
-           f"Conciergeries agrégées, NMI regroupé. % = vs mois précédent."
+           f"Conciergeries agrégées, NMI regroupé."
            + (" Dernier mois en MTD." if is_mtd else ""))
 
     css = """
@@ -4913,23 +4901,22 @@ def render_exec_billing_quarter(df: pd.DataFrame, period_start: date,
                   border-radius:4px; margin-bottom:12px; font-size:13px; }
       table.eqb { border-collapse: separate; border-spacing: 0; background:white;
                   border:1px solid #cbd5e1; border-radius:8px; overflow:hidden; }
-      table.eqb th, table.eqb td { padding:7px 10px; text-align:center; white-space:nowrap; }
+      table.eqb th, table.eqb td { padding:8px 12px; text-align:center; white-space:nowrap;
+                                   border-right:1px solid #eef1f5; }
       table.eqb thead th { background:#0f172a; color:white; font-weight:600; }
-      th.eqb-grp { border-left:2px solid #334155; font-size:13px; }
+      /* Séparation nette ENTRE PSP : trait épais foncé au bord des groupes. */
+      th.eqb-grp { border-left:3px solid #0f172a; font-size:13px; }
       th.eqb-mo { background:#1e293b; color:#cbd5e1; font-weight:500; font-size:12px; }
       th.eqb-kpi, td.eqb-kpi { text-align:left; position:sticky; left:0; z-index:1;
                                min-width:210px; }
       th.eqb-kpi { background:#1e293b; color:white; }
-      td.eqb-kpi { background:#f8fafc; color:#0f172a; font-weight:600; }
+      td.eqb-kpi { background:#f8fafc; color:#0f172a; font-weight:600;
+                   border-right:2px solid #cbd5e1; }
       td.eqb-val { color:#0f172a; min-width:74px; }
       .eqb-v { font-weight:600; }
-      .eqb-m { font-size:11px; }
-      .eqb-mom-good { color:#16a34a; }
-      .eqb-mom-bad { color:#dc2626; }
-      .eqb-mom-neu { color:#94a3b8; }
       td.eqb-total, th.eqb-total { background:#f1f5f9; }
       th.eqb-total { background:#0b1220; }
-      td.eqb-bound { border-right:2px solid #cbd5e1; }
+      td.eqb-bound { border-right:3px solid #64748b !important; }
       tr.eqb-sec td { background:#0f172a; color:white; text-transform:uppercase;
                       font-weight:700; text-align:left; letter-spacing:.04em; }
       tr.eqb-sub td { background:#e2e8f0; color:#0f172a; text-align:left;
