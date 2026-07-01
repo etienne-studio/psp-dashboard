@@ -4432,9 +4432,10 @@ def render_exec_quarter(df: pd.DataFrame, period_start: date, period_end: date) 
     for label, fn, tfn in kpis:
         cells = ""
         for i, p in enumerate(shown):
+            band = " eq-band" if i % 2 else ""
             for j, (b, _l) in enumerate(buckets):
                 gs = " eq-gsep" if j == 0 else ""
-                cells += f"<td class='eq-val{gs}'>{fn(p, b)}</td>"
+                cells += f"<td class='eq-val{gs}{band}'>{fn(p, b)}</td>"
         for j, (b, _l) in enumerate(buckets):
             gs = " eq-gsep" if j == 0 else ""
             cells += f"<td class='eq-val eq-total{gs}'>{tfn(b)}</td>"
@@ -4457,14 +4458,14 @@ def render_exec_quarter(df: pd.DataFrame, period_start: date, period_end: date) 
                                  border-right:1px solid #eef1f5; }
       table.eq thead th { background:#0f172a; color:white; font-weight:600;
                           position:sticky; top:0; }
-      /* Séparation nette ENTRE PSP : bordure gauche continue (en-tête + lignes)
-         au début de chaque bloc PSP -> une seule ligne verticale nette. */
-      th.eq-grp { border-left:3px solid #334155; font-size:13px; }
-      th.eq-gsep, td.eq-gsep { border-left:3px solid #334155 !important; }
+      /* Séparation ENTRE PSP : gros trait vertical + fond de bloc alterné. */
+      th.eq-grp { border-left:4px solid #0f172a; font-size:13px; }
+      th.eq-gsep, td.eq-gsep { border-left:4px solid #0f172a !important; }
+      td.eq-band { background:#e8edf3 !important; }
       th.eq-mo { background:#1e293b; color:#cbd5e1; font-weight:500; font-size:12px; }
       th.eq-kpi, td.eq-kpi { text-align:left; position:sticky; left:0; z-index:1;
                              background:#1e293b; color:white; font-weight:600; min-width:200px; }
-      td.eq-kpi { background:#f8fafc; color:#0f172a; border-right:2px solid #cbd5e1; }
+      td.eq-kpi { background:#f8fafc; color:#0f172a; border-right:3px solid #0f172a; }
       td.eq-val { color:#0f172a; min-width:78px; }
       .eq-total { background:#f1f5f9; font-weight:700; }
       th.eq-total { background:#1e293b; }
@@ -4883,9 +4884,11 @@ def render_exec_billing_quarter(df: pd.DataFrame, period_start: date,
             body += (f"<tr class='eqb-sub'><td colspan='{ncols}'>{label}</td></tr>")
             continue
         cells = ""
-        for p in shown:
+        for ki, p in enumerate(shown):
+            band = " eqb-band" if ki % 2 else ""
             for j, (b, _l) in enumerate(buckets):
-                cells += cell(fn, fmt, lower, [p], b, " eqb-gsep" if j == 0 else "")
+                cells += cell(fn, fmt, lower, [p], b,
+                              (" eqb-gsep" if j == 0 else "") + band)
         for j, (b, _l) in enumerate(buckets):
             cells += cell(fn, fmt, lower, shown, b,
                           " eqb-total" + (" eqb-gsep" if j == 0 else ""))
@@ -4907,16 +4910,18 @@ def render_exec_billing_quarter(df: pd.DataFrame, period_start: date,
       table.eqb th, table.eqb td { padding:8px 12px; text-align:center; white-space:nowrap;
                                    border-right:1px solid #eef1f5; }
       table.eqb thead th { background:#0f172a; color:white; font-weight:600; }
-      /* Séparation nette ENTRE PSP : bordure gauche continue (en-tête + lignes)
-         au début de chaque bloc PSP -> une seule ligne verticale nette. */
-      th.eqb-grp { border-left:3px solid #334155; font-size:13px; }
-      th.eqb-gsep, td.eqb-gsep { border-left:3px solid #334155 !important; }
+      /* Séparation ENTRE PSP : gros trait vertical + fond de bloc alterné
+         (les bandeaux de section coupent le trait, mais le fond garde les
+         blocs PSP lisibles de haut en bas). */
+      th.eqb-grp { border-left:4px solid #0f172a; font-size:13px; }
+      th.eqb-gsep, td.eqb-gsep { border-left:4px solid #0f172a !important; }
+      td.eqb-band { background:#e8edf3 !important; }
       th.eqb-mo { background:#1e293b; color:#cbd5e1; font-weight:500; font-size:12px; }
       th.eqb-kpi, td.eqb-kpi { text-align:left; position:sticky; left:0; z-index:1;
                                min-width:210px; }
       th.eqb-kpi { background:#1e293b; color:white; }
       td.eqb-kpi { background:#f8fafc; color:#0f172a; font-weight:600;
-                   border-right:2px solid #cbd5e1; }
+                   border-right:3px solid #0f172a; }
       td.eqb-val { color:#0f172a; min-width:74px; }
       .eqb-v { font-weight:600; }
       td.eqb-total, th.eqb-total { background:#f1f5f9; }
