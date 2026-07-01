@@ -2715,6 +2715,7 @@ def funnel_graph_data(
     picked_end: date = None,
     today: date = None,
     brand_type: str = "Booking",
+    df_vamp: pd.DataFrame = None,
 ) -> pd.DataFrame:
     """Aggregate raw funnel df → tidy long DataFrame for plotting.
 
@@ -2796,6 +2797,24 @@ def funnel_graph_data(
         acc["cancel_u"] += int(r["tbb_cancel_users"])
         acc["tbb"] = max(acc["elig_u"] - acc["cancel_u"], 0)
 
+    # Agrégation VAMP réels par cellule (si df_vamp fourni). Structure indexée
+    # par (t_key, c_val) identique aux `cells`.
+    vamp_cells: dict = {}
+    if df_vamp is not None and not df_vamp.empty:
+        for _, r in df_vamp.iterrows():
+            t_key = _parse_time(r["week_start"])
+            c_val = _safe_str(r.get(f"dim_{curve_dim_key}", "")) if curve_dim_key else "Total"
+            if c_val == "":
+                c_val = "(empty)"
+            v = vamp_cells.setdefault((t_key, c_val), {
+                "booking_r1plus_succ": 0, "booking_r1plus_alerted": 0,
+                "total_succ": 0, "total_alerted": 0,
+            })
+            v["booking_r1plus_succ"]    += int(r.get("booking_r1plus_succ", 0) or 0)
+            v["booking_r1plus_alerted"] += int(r.get("booking_r1plus_alerted", 0) or 0)
+            v["total_succ"]             += int(r.get("total_succ", 0) or 0)
+            v["total_alerted"]          += int(r.get("total_alerted", 0) or 0)
+
     def _ratio(num, denom):
         # Returns None when the denominator is too small to be meaningful — the
         # graph will then show a gap for that point. Volume KPIs (which call
@@ -2862,14 +2881,14 @@ def funnel_graph_data(
 
         # LTV Simulator — Booking only, requires curve_dim = price_booking
         # so the cell's c_val IS the price bucket.
-        if brand_type == "Booking" and curve_dim_key == "price_booking" \
-                and c_val in LTV_PRICE_CONFIG:
+        _is_ltv_cell = (
+            brand_type == "Booking" and curve_dim_key == "price_booking"
+            and c_val in LTV_PRICE_CONFIG
+        )
+        if _is_ltv_cell:
             _today_g = today or date.today()
             _picked_end_g = picked_end or _today_g
             # Cohort end = t_key + period span, CAPPED by picked_end_g.
-            # (Si la sidebar plafonne la fenêtre, le LATEST user de la cohorte
-            # est <= picked_end → permet à la cohorte du mois en cours d'être
-            # mature dès que picked_end est >= trial_days avant today.)
             if time_dim_key == "date_day":
                 _ce = t_key
             elif time_dim_key == "date_week":
@@ -2884,35 +2903,63 @@ def funnel_graph_data(
                     _ce = _picked_end_g
             else:
                 _ce = _picked_end_g
-            # Cap par picked_end (cf. _ltv_cohort_end_date)
             if _ce is not None and _picked_end_g is not None:
                 _ce = min(_ce, _picked_end_g)
             _gdat = {"r0_succeeded": g0("r0_succeeded"), "rx": agg.get("rx", {})}
             # Sim Total (maturité naturelle) — réel obs R1..r_max_obs + proj
             _sim = _ltv_compute(_gdat, c_val, _ce, _today_g)
-            if _sim is not None:
-                # Anciens noms (compat Funnel Booking)
-                kpis["ARPU brute (€)"] = _sim["arpu_brut_eur"]
-                kpis["ARPU net (€)"]   = _sim["arpu_net_eur"]
-                kpis["LTV brute (€)"]  = _sim["ltv_brut_eur"]
-                kpis["LTV net (€)"]    = _sim["ltv_net_eur"]
-                # Nouveaux noms (tab LTV — section Cohorte totale)
-                kpis["ARPU réel cumulé brut (€)"] = _sim["arpu_brut_eur"]
-                kpis["ARPU réel cumulé net (€)"]  = _sim["arpu_net_eur"]
-                kpis["LTV brute totale (€)"]      = _sim["ltv_brut_eur"]
-                kpis["LTV nette totale (€)"]      = _sim["ltv_net_eur"]
             # Sim R1-only (force r_max_obs=1) — projection naïve depuis R1
             _sim_r1 = _ltv_compute(_gdat, c_val, _ce, _today_g,
                                     r_max_obs_override=1)
-            if _sim_r1 is not None:
-                kpis["LTV brute R1 (€)"] = _sim_r1["ltv_brut_eur"]
-                kpis["LTV nette R1 (€)"] = _sim_r1["ltv_net_eur"]
-            # ARPU R1 = R1 NET users × prix / R0 (= revenue NET R1 par R0)
             _arpt = LTV_PRICE_CONFIG[c_val][2]
             _r0 = g0("r0_succeeded")
-            if _r0 > 0:
-                _r1_net = gr("1", "succ_u") - gr("1", "refund_u")
-                kpis["ARPU R1 (€)"] = (_r1_net / _r0) * _arpt
+        else:
+            _sim = None
+            _sim_r1 = None
+            _arpt = None
+            _r0 = g0("r0_succeeded")
+
+        # ARPU R1 (€) — R1 NET users × prix / R0
+        if _is_ltv_cell and _r0 > 0:
+            _r1_net = gr("1", "succ_u") - gr("1", "refund_u")
+            kpis["ARPU R1 (€)"] = (_r1_net / _r0) * _arpt
+        else:
+            kpis["ARPU R1 (€)"] = None
+
+        # ARPU Total (€) — revenue NET cumulé observé R1..r_max_obs / R0
+        kpis["ARPU Total (€)"] = _sim["arpu_net_eur"] if _sim else None
+
+        # LTV Base R1 — projection naïve depuis R1
+        kpis["LTV brute - Base R1 (€)"] = _sim_r1["ltv_brut_eur"] if _sim_r1 else None
+        kpis["LTV nette - Base R1 (€)"] = _sim_r1["ltv_net_eur"] if _sim_r1 else None
+
+        # LTV Base Totale — observé R1..r_max_obs + projection
+        kpis["LTV brute - Base Totale (€)"] = _sim["ltv_brut_eur"] if _sim else None
+        kpis["LTV nette - Base Totale (€)"] = _sim["ltv_net_eur"] if _sim else None
+
+        # Anciens noms (compat Funnel Booking LTV Simulator)
+        if _sim is not None:
+            kpis["ARPU brute (€)"] = _sim["arpu_brut_eur"]
+            kpis["ARPU net (€)"]   = _sim["arpu_net_eur"]
+            kpis["LTV brute (€)"]  = _sim["ltv_brut_eur"]
+            kpis["LTV net (€)"]    = _sim["ltv_net_eur"]
+
+        # VAMP réels — via df_vamp (agrégé dans vamp_cells)
+        _vc = vamp_cells.get((t_key, c_val))
+        if _vc is not None:
+            _b_s = _vc["booking_r1plus_succ"]
+            _b_a = _vc["booking_r1plus_alerted"]
+            _t_s = _vc["total_succ"]
+            _t_a = _vc["total_alerted"]
+            kpis["Vamp Ratio - Abo Booking Only"] = (_b_a / _b_s) if _b_s > 0 else None
+            kpis["VAMP Ratio - Total"] = (_t_a / _t_s) if _t_s > 0 else None
+        else:
+            kpis["Vamp Ratio - Abo Booking Only"] = None
+            kpis["VAMP Ratio - Total"] = None
+
+        # VAMP projetés — TODO (à implémenter avec widgets Streamlit + ratios sheet)
+        kpis["Vamp Ratio - Abo Booking Only (projeté)"] = None
+        kpis["VAMP Ratio - Total (projeté)"] = None
 
         # Seuil 200 R0 — masque toute la cellule (KPI volume ET ratio) si
         # r0_succeeded < MIN_R0_DISPLAY. value=None → Plotly affiche un trou.
@@ -2935,7 +2982,8 @@ def funnel_graph_data(
 def render_funnel_graph(brand_type: str, filters: dict, picked_start, picked_end, key_prefix: str,
                          kpi_sections: list = None, all_kpis: list = None,
                          max_rx: int = 4,
-                         max_rx_observed_dynamic: bool = False) -> None:
+                         max_rx_observed_dynamic: bool = False,
+                         enable_ltv_vamp: bool = False) -> None:
     """Render the "Évolution dans le temps" graph section under a funnel tab.
 
     Layout mirrors the funnel TABLE structure:
@@ -3007,9 +3055,17 @@ def render_funnel_graph(brand_type: str, filters: dict, picked_start, picked_end
                 max_rx=max_rx, max_rx_observed=_gmax_rx_obs,
                 picked_end=picked_end,
             ))
+            # VAMP réels (tab LTV seulement, via enable_ltv_vamp)
+            df_vamp_graph = None
+            if enable_ltv_vamp:
+                df_vamp_graph = run_query(ltv_vamp_sql(
+                    filters, graph_dims_list, graph_weeks_list,
+                    picked_end=picked_end,
+                ))
             graph_df = funnel_graph_data(
                 raw_df, graph_time_dim[0], curve_key,
                 picked_end=picked_end, brand_type=brand_type,
+                df_vamp=df_vamp_graph,
             )
         except Exception as e:
             st.error(f"Erreur graphe : {e}")
@@ -6081,6 +6137,7 @@ elif page == "LTV":
         "Booking", filters, _picked_start, _picked_end, key_prefix="ltv",
         kpi_sections=LTV_KPI_SECTIONS, all_kpis=ALL_LTV_KPIS,
         max_rx=2, max_rx_observed_dynamic=True,
+        enable_ltv_vamp=True,
     )
 
 elif page == "VAMP Cohort":
